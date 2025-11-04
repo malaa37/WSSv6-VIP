@@ -283,15 +283,36 @@ def main_loop():
                                 f"30m_rev: bull={out['rev30_bull']} bear={out['rev30_bear']}")
                         send_telegram(msg)
                     elif out.get("signal_type") == "pre-signal":
-                        presignal.append(out)
-                        msg = (f"{out['symbol']} — {out['side']} (pre-signal)\n"
-                               f"Price: {out['entry']}  RSI: {out['rsi']}\n")
-                        if out.get("sizing"):
-                            sz = out['sizing']
-                            msg += (f"Risk_USD: ${sz['risk_usd']} | Notional: ${sz['notional_usd']} | "
-                                    f"Margin(approx): ${sz['margin_usd']} @ {int(DEFAULT_LEVERAGE)}x\n")
-                        msg += f"4H/1H: {out['dir4']}/{out['dir1']}"
-                        send_telegram(msg)
+    presignal.append(out)
+    # تنسيق الزوج بصيغة USDT.P مثل منصة MEXC
+    symbol_fmt = out["symbol"].replace("/USDT", "/USDT.P").replace(":USDT", "/USDT.P")
+
+    msg = (
+        f"📊 <b>WSS Signal (Analytical)</b>\n"
+        f"PAIR: {symbol_fmt}\n"
+        f"TYPE: {out['signal_type'].upper()}\n"
+        f"SIDE: {out['side']}\n\n"
+        f"ENTRY: {out['entry']}\n"
+        f"SL: {out['sl']}\n"
+        f"TP1: {out['tp1']}\n"
+        f"TP2: {out['tp2']}\n\n"
+    )
+
+    if out.get("sizing"):
+        sz = out["sizing"]
+        msg += (
+            f"Risk_USD: ${sz['risk_usd']} | Notional: ${sz['notional_usd']} | "
+            f"Margin(approx): ${sz['margin_usd']} @ {int(DEFAULT_LEVERAGE)}x\n\n"
+        )
+
+    msg += (
+        f"RSI(15m): {out['rsi']} | 4H/1H: {out['dir4']}/{out['dir1']}\n"
+        f"Reversal(30m): bull={out['rev30_bull']} bear={out['rev30_bear']}\n\n"
+        f"⚠️ <i>هذا تحليل فقط — لا أوامر تلقائية. نفّذ يدويًا (Isolated 50x).</i>"
+    )
+
+    send_telegram(msg)
+
                     else:
                         # near formation alert
                         note = out.get("note", "")
@@ -335,5 +356,6 @@ if __name__ == '__main__':
         except Exception as e:
             logging.exception("Main loop crashed: %s — restarting in 10s", e)
             time.sleep(10)
+
 
 
