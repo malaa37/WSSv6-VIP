@@ -247,6 +247,8 @@ if __name__ == '__main__':
 
  import datetime
 
+import datetime
+
 while True:
     try:
         logging.info(f"Ping OK — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
