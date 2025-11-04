@@ -119,7 +119,7 @@ def init_exchange():
             "apiKey": MEXC_API_KEY,
             "secret": MEXC_API_SECRET,
             "enableRateLimit": True,
-            "options": {"defaultType": "future", "adjustForTimeDifference": True}
+            "options": {"defaultType": "future", "adjustForTimeDifference": False}
         })
         ex.load_markets(True)
         logging.info("✅ Connected to MEXC Futures API (read-only).")
@@ -335,3 +335,4 @@ if __name__ == '__main__':
         except Exception as e:
             logging.exception("Main loop crashed: %s — restarting in 10s", e)
             time.sleep(10)
+
