@@ -127,7 +127,7 @@ def init_exchange():
         return ex
     except Exception as e:
         logging.exception("Failed to init exchange: %s", e)
-        send_telegram(f"❌ MEXC connection failed: {e}")
+        # send_telegram(f"❌ MEXC connection failed: {e}")  # disabled to stop spam
         return None
 
 # -------------- Position sizing (fixed RISK_USD) --------------
@@ -335,4 +335,5 @@ if __name__ == '__main__':
         except Exception as e:
             logging.exception("Main loop crashed: %s — restarting in 10s", e)
             time.sleep(10)
+
 
