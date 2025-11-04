@@ -1,7 +1,7 @@
 services:
   - type: web
-    name: wss-v6-1
+    name: wss-safe-template
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: python -m pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
     startCommand: python main.py
