@@ -274,6 +274,10 @@ def run_flask():
 if __name__ == '__main__':
     threading.Thread(target=run_flask, daemon=True).start()
     logging.info("WSS Analytical launching main loop...")
+
+    # 🔔 تنبيه ذكي عند كل إعادة تشغيل أو Deploy
+    send_telegram("✅ WSS Analytical Bot restarted successfully and is now live. Monitoring markets again 🚀")
+
     try:
         main_loop()
     except KeyboardInterrupt:
