@@ -1,3 +1,5 @@
-flask
+ccxt
+numpy
 python-dotenv
 pyTelegramBotAPI
+flask
