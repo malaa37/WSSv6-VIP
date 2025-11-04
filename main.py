@@ -245,9 +245,14 @@ if __name__ == '__main__':
     logging.getLogger().setLevel(logging.DEBUG)
     threading.Thread(target=run_flask, daemon=True).start()
 
-    while True:
-        try:
-            main_loop()
-        except Exception as e:
-            logging.exception(f"Main loop crashed: {e}")
-            time.sleep(10)
+ import datetime
+
+while True:
+    try:
+        logging.info(f"Ping OK — {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        main_loop()
+    except Exception as e:
+        logging.exception(f"Main loop crashed: {e}")
+    finally:
+        # تأكد إن الحلقة تفضل دايمًا شغالة حتى لو Render عمل sleep
+        time.sleep(60)
