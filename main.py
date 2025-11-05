@@ -668,7 +668,6 @@ def send_manual_backup(update=None):
 
 # تسجيل أمر /backup للبوت
 def handle_command(command):
-    
 if __name__ == "__main__":
     try:
         main()
@@ -676,4 +675,5 @@ if __name__ == "__main__":
         logger.info("Interrupted by user.")
     except Exception as e:
         logger.exception("Fatal error: %s", e)
+
 
