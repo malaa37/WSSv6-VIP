@@ -451,20 +451,36 @@ def check_signal_status(record):
         return {"status":"unknown","hit_time":None,"hit_price":None}
 
 # ----------------------------
-# SUMMARY WORKER (6H) with local archiver
-# ----------------------------
-def next_scheduled_run(now_utc):
-    today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    candidates = []
-    for d in [0,1]:
-        base = today + timedelta(days=d)
-        for h in SUMMARY_HOURS_UTC:
-            candidates.append(base + timedelta(hours=h))
-    candidates = sorted(candidates)
-    for c in candidates:
-        if c > now_utc:
-            return c
-    return now_utc + timedelta(hours=6)
+# ---------- SUMMARY WORKER ----------
+def summary_worker():
+    """
+    Runs the 6-hour summary report automatically.
+    Sleeps until the next UTC checkpoint (00:00, 06:00, 12:00, 18:00),
+    then generates and sends the report to Telegram and saves JSON locally.
+    """
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            # نقاط التشغيل: 00:00 / 06:00 / 12:00 / 18:00 UTC
+            hours = [0, 6, 12, 18]
+            nxt_hour = min([h for h in hours if h > now_utc.hour] or [hours[0]])
+            nxt_day = now_utc if nxt_hour > now_utc.hour else now_utc + timedelta(days=1)
+            nxt_run = nxt_day.replace(hour=nxt_hour, minute=0, second=5, microsecond=0)
+
+            wait_sec = (nxt_run - now_utc).total_seconds()
+            logging.info("Summary worker sleeping until %s UTC (%.0f seconds)", nxt_run.strftime("%Y-%m-%d %H:%M"), wait_sec)
+            time.sleep(max(60, wait_sec))  # ماينفعش ينتظر أقل من دقيقة
+
+            # تنفيذ التقرير
+            build_and_send_6h_summary()
+            logging.info("6-hour summary successfully executed at %s UTC", nxt_run.strftime("%Y-%m-%d %H:%M"))
+
+            # ننام 5 دقائق احتياط بعد التنفيذ
+            time.sleep(300)
+        except Exception as e:
+            logging.exception("summary_worker error: %s", e)
+            time.sleep(300)
+
 
 def build_and_send_6h_summary():
     now = datetime.now(timezone.utc)
@@ -784,3 +800,4 @@ if __name__ == "__main__":
         main_loop()
     except Exception as e:
         logging.exception("Fatal startup error: %s", e)
+
