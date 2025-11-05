@@ -218,3 +218,6 @@ if __name__ == "__main__":
     time.sleep(5)
     send_telegram_text("✅ WSS Analytical Bot restarted and fully live. Starting main analysis loop...")
     try:
+        main_loop()
+    except Exception as e:
+        logging.exception(f"Main loop crash: {e}")
