@@ -1,740 +1,54 @@
-#!/usr/bin/env python3
-# ============================================================
-# WSS v7.3 — Full analytical engine (ICT/SMC + OB/FVG + Reversal + Divergence)
-#  - 6H summaries, daily master report, archiving, telegram alerts
-#  - Designed for MEXC Futures USDT.P symbols
-# ============================================================
+# ============================
+# WSSv-Full — main.py (Part 1/3)
+# Core imports, config, utilities, storage, telegram helper
+# ============================
 
-# -------------------------
-# Imports & basic setup
-# -------------------------
 import os
 import time
 import json
 import logging
 import threading
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
+
 import requests
-from datetime import datetime, timezone, timedelta
+import ccxt
+import numpy as np
 from flask import Flask, jsonify
 
-import numpy as np
-import ccxt
-import telebot
+# ---------- CONFIG ----------
+# These should be set in your Render / env or in a .env secret file
+MEXC_API_KEY = os.getenv("MEXC_KEY", "")
+MEXC_API_SECRET = os.getenv("MEXC_SECRET", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # channel id or chat id
 
-# -------------------------
-# Configuration (env-first)
-# -------------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
+# Runtime tuning
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))   # how many markets to scan max
+INTERVAL_SECONDS = int(os.getenv("CYCLE_INTERVAL", "900"))  # default 15m cycles
+RISK_USD = float(os.getenv("RISK_USD", "10.0"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))  # seconds
+SILENCE_ALERT_HOURS = int(os.getenv("SILENCE_ALERT_HOURS", "6"))
 
-MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
-MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
-
-DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "50"))
-INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "900"))  # 15 min cycles
-SUMMARY_HOURS_UTC = [0, 6, 12, 18]
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
-RISK_USD = float(os.getenv("RISK_USD", "10"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
-
-SIGNALS_LOG_FILE = os.getenv("SIGNALS_LOG_FILE", "signals_log.json")
-SIGNALS_RETENTION_HOURS = int(os.getenv("SIGNALS_RETENTION_HOURS", "72"))
-SILENCE_ALERT_HOURS = int(os.getenv("SILENCE_ALERT_HOURS", "3"))
-
-EMA_NEAR_RATIO = float(os.getenv("EMA_NEAR_RATIO", "0.002"))   # 0.2% diff considered "near"
-RSI_NEAR_DELTA = float(os.getenv("RSI_NEAR_DELTA", "2.0"))
-
-OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", "20"))
-OB_BODY_RATIO = float(os.getenv("OB_BODY_RATIO", "0.6"))
-FVG_LOOKBACK = int(os.getenv("FVG_LOOKBACK", "12"))
-FVG_MIN_GAP = float(os.getenv("FVG_MIN_GAP", "0.0001"))
+# Report schedule (UTC checkpoints for 6H summary)
+SUMMARY_CHECKPOINTS = [0, 6, 12, 18]  # hours UTC
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-logging.getLogger("ccxt").setLevel(logging.WARNING)
+logger = logging.getLogger("WSS")
 
-# Telegram bot
-bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
+# ---------- DIRECTORIES ----------
+os.makedirs("reports", exist_ok=True)
+os.makedirs("daily_reports", exist_ok=True)
+os.makedirs("signals", exist_ok=True)
 
-def send_telegram_text(text):
-    """Send text to TG (safe wrapper). Appends static footer warning."""
-    footer = "\n\n⚠️ هذا تحليل فقط — لا أوامر تلقائية. تأكد من السيولة، الانزلاق، والعمولات قبل التنفيذ."
-    msg = text + footer
-    if bot and CHAT_ID:
-        try:
-            bot.send_message(CHAT_ID, msg)
-            time.sleep(0.6)
-        except Exception as e:
-            logging.warning("TG send error: %s", e)
-    else:
-        # in debug mode print to logs so we can still see outputs
-        logging.info("TG(DISABLED): %s", msg.replace("\n", " | "))
+# ---------- EXCHANGE INIT (lazy) ----------
+exchange_instance: Optional[ccxt.mexc] = None
 
-# -------------------------
-# Data fetch helpers
-# -------------------------
-def fetch_ohlcv_safe(ex, symbol, timeframe, limit=200, since=None):
-    """
-    Returns arrays: open, high, low, close, volume (numpy arrays) or (None,...)
-    Compatible with ccxt fetch_ohlcv returns.
-    """
-    try:
-        if since:
-            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
-        else:
-            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        arr = np.array(data)
-        if arr.size == 0:
-            return None, None, None, None, None
-        # ccxt: [timestamp, open, high, low, close, volume]
-        return arr[:,1].astype(float), arr[:,2].astype(float), arr[:,3].astype(float), arr[:,4].astype(float), arr[:,5].astype(float)
-    except Exception as e:
-        logging.debug("fetch_ohlcv_safe %s %s -> %s", symbol, timeframe, e)
-        return None, None, None, None, None
-
-def fetch_ticker_safe(ex, symbol):
-    try:
-        t = ex.fetch_ticker(symbol)
-        last = t.get("last") or t.get("close") or t.get("info",{}).get("lastPrice")
-        return float(last) if last is not None else None
-    except Exception as e:
-        logging.debug("fetch_ticker_safe %s -> %s", symbol, e)
-        return None
-
-# -------------------------
-# Indicators (numpy)
-# -------------------------
-def ema(series, period):
-    s = np.asarray(series, dtype=float)
-    if len(s) < period:
-        return np.array([])
-    alpha = 2.0 / (period + 1.0)
-    out = np.empty_like(s)
-    out[0] = s[0]
-    for i in range(1, len(s)):
-        out[i] = alpha * s[i] + (1 - alpha) * out[i-1]
-    return out
-
-def rsi(series, period=14):
-    s = np.asarray(series, dtype=float)
-    if len(s) < period + 1:
-        return np.array([])
-    d = np.diff(s)
-    up = np.where(d > 0, d, 0.0)
-    down = np.where(d < 0, -d, 0.0)
-    up_ewm = np.convolve(up, np.ones(period)/period, mode='valid')
-    down_ewm = np.convolve(down, np.ones(period)/period, mode='valid')
-    rs = up_ewm / (down_ewm + 1e-12)
-    return 100.0 - (100.0 / (1.0 + rs))
-
-# -------------------------
-# ICT / SMC style helpers (OB / FVG detection)
-# -------------------------
-def detect_order_blocks_from_ohlcv(open_a, high_a, low_a, close_a, lookback=OB_LOOKBACK, body_ratio=OB_BODY_RATIO):
-    bullish_OBs, bearish_OBs = [], []
-    try:
-        n = len(close_a)
-        if n < 3:
-            return bullish_OBs, bearish_OBs
-        start = max(2, n - lookback)
-        for i in range(start, n-1):
-            o, h, l, c = float(open_a[i]), float(high_a[i]), float(low_a[i]), float(close_a[i])
-            rng = h - l if (h - l) != 0 else 1e-9
-            body = abs(c - o)
-            br = body / rng
-            next_c = float(close_a[i+1])
-            # bullish OB: bearish candle followed by bullish continuation
-            if (c < o) and (br >= body_ratio) and (next_c > c):
-                bullish_OBs.append({"low": min(c,o), "high": max(c,o), "idx": i})
-            # bearish OB: bullish candle followed by bearish continuation
-            if (c > o) and (br >= body_ratio) and (next_c < c):
-                bearish_OBs.append({"low": min(c,o), "high": max(c,o), "idx": i})
-    except Exception as e:
-        logging.debug("detect_order_blocks error: %s", e)
-    return bullish_OBs, bearish_OBs
-
-def detect_fvg_from_ohlcv(high_arr, low_arr, lookback=FVG_LOOKBACK, min_gap_rel=FVG_MIN_GAP):
-    fvg_list = []
-    try:
-        n = len(high_arr)
-        start = max(2, n - lookback)
-        for i in range(start, n-1):
-            prev_high, prev_low = float(high_arr[i-1]), float(low_arr[i-1])
-            mid_high, mid_low = float(high_arr[i]), float(low_arr[i])
-            # bullish FVG: gap where previous low is above mid high
-            if prev_low - mid_high > abs(prev_low) * min_gap_rel:
-                fvg_list.append({"low": mid_high, "high": prev_low, "idx": i, "type":"bullish"})
-            # bearish FVG: gap where mid low is above previous high
-            if mid_low - prev_high > abs(prev_high) * min_gap_rel:
-                fvg_list.append({"low": prev_high, "high": mid_low, "idx": i, "type":"bearish"})
-    except Exception as e:
-        logging.debug("detect_fvg error: %s", e)
-    return fvg_list
-
-def find_confirmation_in_ob_fvg(ex, symbol, entry_price, side):
-    """
-    Checks 1H and 30m for OB/FVG close to entry_price.
-    Returns dict {ob:bool, fvg:bool, details:...}
-    """
-    try:
-        sym_ccxt = symbol.replace("/USDT.P","/USDT") if symbol.endswith("/USDT.P") else symbol
-        o1,h1,l1,c1,v1 = fetch_ohlcv_safe(ex, sym_ccxt, "1h", limit=OB_LOOKBACK+10)
-        o30,h30,l30,c30,v30 = fetch_ohlcv_safe(ex, sym_ccxt, "30m", limit=OB_LOOKBACK+10)
-        ob_hit, fvg_hit = False, False
-        details = {"1h":{}, "30m":{}}
-        margin = 0.002  # 0.2%
-        if c1 is not None:
-            bull_ob, bear_ob = detect_order_blocks_from_ohlcv(o1,h1,l1,c1,lookback=OB_LOOKBACK)
-            fvg1 = detect_fvg_from_ohlcv(h1,l1,lookback=FVG_LOOKBACK)
-            for ob in bull_ob + bear_ob:
-                mid = (ob["low"] + ob["high"]) / 2.0
-                if abs(entry_price - mid) / max(entry_price,1e-12) <= margin:
-                    ob_hit = True
-                    details["1h"].setdefault("ob",[]).append(ob)
-            for f in fvg1:
-                if entry_price >= f["low"]*(1-margin) and entry_price <= f["high"]*(1+margin):
-                    fvg_hit = True
-                    details["1h"].setdefault("fvg",[]).append(f)
-        if c30 is not None:
-            bull_ob2, bear_ob2 = detect_order_blocks_from_ohlcv(o30,h30,l30,c30,lookback=OB_LOOKBACK)
-            fvg2 = detect_fvg_from_ohlcv(h30,l30,lookback=FVG_LOOKBACK)
-            for ob in bull_ob2 + bear_ob2:
-                mid = (ob["low"] + ob["high"]) / 2.0
-                if abs(entry_price - mid) / max(entry_price,1e-12) <= margin:
-                    ob_hit = True
-                    details["30m"].setdefault("ob",[]).append(ob)
-            for f in fvg2:
-                if entry_price >= f["low"]*(1-margin) and entry_price <= f["high"]*(1+margin):
-                    fvg_hit = True
-                    details["30m"].setdefault("fvg",[]).append(f)
-        return {"ob": ob_hit, "fvg": fvg_hit, "details": details}
-    except Exception as e:
-        logging.debug("find_confirmation_in_ob_fvg error: %s", e)
-        return {"ob": False, "fvg": False, "details": {}}
-
-# -------------------------
-# Reversal candles & divergence
-# -------------------------
-def detect_reversal_candle(o,h,l,c):
-    """
-    Simple detection for doji, hammer, shooting star.
-    Returns string or None.
-    """
-    try:
-        o,h,l,c = float(o), float(h), float(l), float(c)
-    except:
-        return None
-    body = abs(c - o)
-    rng = h - l if (h - l) != 0 else 1e-9
-    upper = h - max(c, o)
-    lower = min(c, o) - l
-    # Doji-like: tiny body and long wicks both sides
-    if body / rng < 0.2 and upper > body and lower > body:
-        return "doji"
-    # Hammer: small body near top with long lower wick and bullish close
-    if body / rng > 0.6 and lower > body * 2 and c > o:
-        return "hammer"
-    # Shooting star: small body near bottom with long upper wick and bearish close
-    if body / rng > 0.6 and upper > body * 2 and c < o:
-        return "shooting_star"
-    return None
-
-def detect_rsi_divergence(closes, rsis):
-    """
-    Very simple short-window divergence check:
-    compare last two swings in closes and rsi arrays.
-    """
-    try:
-        if len(closes) < 5 or len(rsis) < 5:
-            return None
-        recent = np.array(closes[-5:], dtype=float)
-        r_recent = np.array(rsis[-5:], dtype=float)
-        # Basic slope sign change: price making lower low while RSI makes higher low -> bullish divergence
-        if recent[-1] < recent[-2] and r_recent[-1] > r_recent[-2]:
-            return "bullish"
-        if recent[-1] > recent[-2] and r_recent[-1] < r_recent[-2]:
-            return "bearish"
-    except Exception as e:
-        logging.debug("detect_rsi_divergence error: %s", e)
-    return None
-# ============================================================
-# PART 2 — Evaluation, Signal storage, Position sizing, Sending
-# ============================================================
-
-def evaluate_symbol(ex, sym):
-    """
-    Return:
-      - {"status":"confirmed", "symbol":sym, "side":"LONG"/"SHORT", "entry":..., "sl":..., "tp1":..., "tp2":..., "rsi":..., "trend":..., "note":...}
-      - {"status":"near", ...}
-      - {"status":"pre", ...}
-      - {"status": None} when not valid or no signal
-    """
-    try:
-        o4,h4,l4,c4,v4 = fetch_ohlcv_safe(ex, sym, "4h")
-        o1,h1,l1,c1,v1 = fetch_ohlcv_safe(ex, sym, "1h")
-        o30,h30,l30,c30,v30 = fetch_ohlcv_safe(ex, sym, "30m")
-        o15,h15,l15,c15,v15 = fetch_ohlcv_safe(ex, sym, "15m")
-        if c4 is None or c1 is None or c30 is None or c15 is None:
-            return {"status": None}
-
-        # Trend alignment on larger TFs
-        e20_4, e50_4 = ema(c4,20), ema(c4,50)
-        e20_1, e50_1 = ema(c1,20), ema(c1,50)
-        if len(e20_4) < 1 or len(e50_4) < 1:
-            return {"status": None}
-        dir4 = "Bull" if e20_4[-1] > e50_4[-1] else "Bear"
-        dir1 = "Bull" if e20_1[-1] > e50_1[-1] else "Bear"
-        # require alignment 4H and 1H (user requirement)
-        if dir4 != dir1:
-            return {"status": None}
-
-        # 15m EMA crosses and RSI confirmations (user requirement)
-        e20_15, e50_15 = ema(c15,20), ema(c15,50)
-        if len(e20_15) < 3 or len(e50_15) < 3:
-            return {"status": None}
-        cross_long = (e20_15[-2] <= e50_15[-2]) and (e20_15[-1] > e50_15[-1])
-        cross_short = (e20_15[-2] >= e50_15[-2]) and (e20_15[-1] < e50_15[-1])
-
-        last_e20 = float(e20_15[-1]); last_e50 = float(e50_15[-1]) if float(e50_15[-1]) != 0 else 1.0
-        ema_rel_diff = abs(last_e20 - last_e50) / abs(last_e50)
-
-        rsi15_arr = rsi(c15,14)
-        rsi_now = float(rsi15_arr[-1]) if len(rsi15_arr) > 0 else 50.0
-        entry = float(c15[-1])
-
-        # provisional stops from 30m structure
-        sl_long = float(min(l30)) if l30 is not None else entry * 0.995
-        sl_short = float(max(h30)) if h30 is not None else entry * 1.005
-
-        # reversal candle + divergence checks on 30m/15m
-        reversal_30 = detect_reversal_candle(o30[-2], h30[-2], l30[-2], c30[-2]) if len(c30) >= 2 else None
-        reversal_15 = detect_reversal_candle(o15[-2], h15[-2], l15[-2], c15[-2]) if len(c15) >= 2 else None
-        div_30 = detect_rsi_divergence(c30, rsi(c30)) if c30 is not None else None
-        div_15 = detect_rsi_divergence(c15, rsi15_arr) if c15 is not None else None
-
-        # Reversal confirmed signal (strong)
-        if (reversal_30 or reversal_15) and (div_30 == "bullish" or div_15 == "bullish") and dir4 == "Bull":
-            tp1 = entry + (entry - sl_long) * 3
-            tp2 = entry + (entry - sl_long) * 6
-            return {"status":"confirmed","symbol":sym,"side":"LONG","entry":entry,"sl":sl_long,"tp1":tp1,"tp2":tp2,"rsi":rsi_now,"trend":f"4H/{dir4} | 1H/{dir1}","note":"Reversal Candle + Bullish Divergence"}
-        if (reversal_30 or reversal_15) and (div_30 == "bearish" or div_15 == "bearish") and dir4 == "Bear":
-            tp1 = entry - (sl_short - entry) * 3
-            tp2 = entry - (sl_short - entry) * 6
-            return {"status":"confirmed","symbol":sym,"side":"SHORT","entry":entry,"sl":sl_short,"tp1":tp1,"tp2":tp2,"rsi":rsi_now,"trend":f"4H/{dir4} | 1H/{dir1}","note":"Reversal Candle + Bearish Divergence"}
-
-        # Confirmed by EMA/RSI + OB/FVG confirmation
-        if dir4 == "Bull" and cross_long and rsi_now > 50:
-            sl = sl_long
-            tp1, tp2 = entry + (entry - sl) * 3, entry + (entry - sl) * 6
-            conf = find_confirmation_in_ob_fvg(ex, sym, entry, "LONG")
-            note = "OB/FVG confirmed on 1H/30m" if (conf["ob"] or conf["fvg"]) else "Confirmed by EMA/RSI"
-            return {"status":"confirmed","symbol":sym,"side":"LONG","entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"rsi":rsi_now,"trend":f"4H/{dir4} | 1H/{dir1}","note":note}
-
-        if dir4 == "Bear" and cross_short and (rsi_now < 50 or rsi_now >= 70):
-            sl = sl_short
-            tp1, tp2 = entry - (sl - entry) * 3, entry - (sl - entry) * 6
-            conf = find_confirmation_in_ob_fvg(ex, sym, entry, "SHORT")
-            note = "OB/FVG confirmed on 1H/30m" if (conf["ob"] or conf["fvg"]) else "Confirmed by EMA/RSI"
-            if rsi_now >= 70:
-                note = "RSI>=70 strong reversal" + (" + " + note if note else "")
-            return {"status":"confirmed","symbol":sym,"side":"SHORT","entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"rsi":rsi_now,"trend":f"4H/{dir4} | 1H/{dir1}","note":note}
-
-        # Pre-signal (trend aligned but need EMA cross or further confirmation)
-        if (dir4 == "Bull" and rsi_now > 50) or (dir4 == "Bear" and rsi_now < 50):
-            return {"status":"pre","symbol":sym,"side":("LONG" if dir4=="Bull" else "SHORT"),"rsi":rsi_now,"ema_rel_diff":ema_rel_diff,"trend":f"4H/{dir4} | 1H/{dir1}"}
-
-        # Near signal (EMAs close or RSI near threshold)
-        if ema_rel_diff <= EMA_NEAR_RATIO or abs(rsi_now - 50.0) <= RSI_NEAR_DELTA:
-            if dir4 == "Bull":
-                side = "LONG"; sl = sl_long; tp1, tp2 = entry + (entry - sl) * 3, entry + (entry - sl) * 6
-            else:
-                side = "SHORT"; sl = sl_short; tp1, tp2 = entry - (sl - entry) * 3, entry - (sl - entry) * 6
-            conf = find_confirmation_in_ob_fvg(ex, sym, entry, side)
-            note = "OB/FVG nearby" if (conf["ob"] or conf["fvg"]) else "No OB/FVG"
-            return {"status":"near","symbol":sym,"side":side,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"rsi":rsi_now,"ema_rel_diff":ema_rel_diff,"trend":f"4H/{dir4} | 1H/{dir1}","note":note}
-
-        return {"status": None}
-    except Exception as e:
-        logging.debug("evaluate_symbol error %s %s", sym, e)
-        return {"status": None}
-
-# ----------------------------
-# SIGNAL STORAGE / LOGGING
-# ----------------------------
-def ensure_signals_file():
-    if not os.path.exists(SIGNALS_LOG_FILE):
-        with open(SIGNALS_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f)
-
-def append_signal_log(rec):
-    ensure_signals_file()
-    try:
-        with open(SIGNALS_LOG_FILE, "r+", encoding="utf-8") as f:
-            try:
-                arr = json.load(f)
-            except Exception:
-                arr = []
-            arr.append(rec)
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=SIGNALS_RETENTION_HOURS)
-            arr = [r for r in arr if datetime.fromisoformat(r["time"]).replace(tzinfo=timezone.utc) >= cutoff]
-            f.seek(0); f.truncate(); json.dump(arr, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.exception("append_signal_log failed: %s", e)
-
-def load_signals():
-    ensure_signals_file()
-    try:
-        with open(SIGNALS_LOG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logging.exception("load_signals failed: %s", e)
-        return []
-
-# ----------------------------
-# POSITION SIZE & FILTERS
-# ----------------------------
-def calc_position_size(entry, sl, leverage, risk_usd):
-    try:
-        stop = abs(entry - sl)
-        if stop <= 0:
-            return None
-        notional = risk_usd / (stop / entry)
-        margin = notional / max(leverage,1)
-        return {"risk_usd": round(risk_usd,2), "notional": round(notional,2), "margin": round(margin,2)}
-    except Exception:
-        return None
-
-def safe_ignore_small_diff(entry, sl):
-    if entry == 0:
-        return True
-    diff_ratio = abs(entry - sl) / abs(entry)
-    return diff_ratio < MIN_SL_ENTRY_DIFF_RATIO
-
-# ----------------------------
-# FORMATTING & SENDING SIGNALS
-# ----------------------------
-def format_trade_text(out, kind="CONFIRMED"):
-    sym = out["symbol"].replace("/USDT","/USDT.P")
-    sz = calc_position_size(out.get("entry",0), out.get("sl",0), DEFAULT_LEVERAGE, RISK_USD) or {}
-    trend = out.get("trend","")
-    note = out.get("note","")
-    if kind == "CONFIRMED":
-        header = "🟢 SIGNAL — " + out["side"]
-        body = (
-            f"PAIR: {sym}\nENTRY: {out['entry']}\nSL: {out['sl']}\nTP1: {out['tp1']}\nTP2: {out['tp2']}\n\n"
-            f"RSI(15m): {round(out.get('rsi',0),2)}\nTrend: {trend}\nLEVERAGE: {DEFAULT_LEVERAGE}x (Isolated)\n"
-            f"RISK: ${sz.get('risk_usd', RISK_USD)} | NOTIONAL: ${sz.get('notional','N/A')} | MARGIN: ${sz.get('margin','N/A')}\n"
-            f"NOTE: {note}\nTIME: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-        return header + "\n\n" + body
-    if kind == "NEAR":
-        header = "🟡 NEAR-CONFIRMED — " + out["side"]
-        body = (
-            f"PAIR: {sym}\nENTRY: {out['entry']}\nSL: {out['sl']}\nTP1: {out['tp1']}\nTP2: {out['tp2']}\n\n"
-            f"RSI(15m): {round(out.get('rsi',0),2)}\nTrend: {trend}\nEMA diff: {round(out.get('ema_rel_diff',0),6)}\n"
-            f"LEVERAGE: {DEFAULT_LEVERAGE}x (Isolated)\n"
-            f"RISK: ${sz.get('risk_usd', RISK_USD)} | NOTIONAL: ${sz.get('notional','N/A')} | MARGIN: ${sz.get('margin','N/A')}\n"
-            f"NOTE: {note}\nTIME: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-            f"⚠️ Near signal (≈80% confirmed) — watch for confirmation next candle."
-        )
-        return header + "\n\n" + body
-    if kind == "PRE":
-        header = "⚪ PRE-SIGNAL — " + out.get("side","")
-        body = (
-            f"PAIR: {sym}\nCURRENT: {round(out.get('entry',0),8)}\nRSI(15m): {round(out.get('rsi',0),2)}\nTrend: {trend}\n"
-            f"EMA diff: {round(out.get('ema_rel_diff',0),6)}\nNOTE: {note}\nTIME: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-            f"Note: Pre-signal — needs EMA cross on 15m to confirm."
-        )
-        return header + "\n\n" + body
-    return ""
-
-def send_and_store(out, kind):
-    # filter tiny entry/sl differences
-    if kind in ("CONFIRMED","NEAR"):
-        if safe_ignore_small_diff(out.get("entry",0), out.get("sl",0)):
-            logging.info("Ignored %s %s: entry/sl diff too small.", kind, out.get("symbol"))
-            return False
-    txt = format_trade_text(out, kind=("CONFIRMED" if kind=="CONFIRMED" else ("NEAR" if kind=="NEAR" else "PRE")))
-    send_telegram_text(txt)
-    if kind in ("CONFIRMED","NEAR"):
-        rec = {"symbol": out["symbol"], "side": out["side"], "entry": out["entry"], "sl": out["sl"], "tp1": out["tp1"], "tp2": out["tp2"], "time": datetime.now(timezone.utc).isoformat(), "kind": kind, "note": out.get("note","")}
-        append_signal_log(rec)
-    return True
-
-# ----------------------------
-# CHECK SIGNAL RESULTS (1m candles or ticker fallback)
-# ----------------------------
-exchange_instance = None
-
-def check_signal_status(record):
-    try:
-        sym = record["symbol"]
-        sym_ccxt = sym.replace("/USDT.P", "/USDT") if sym.endswith("/USDT.P") else sym
-        sent_time = datetime.fromisoformat(record["time"]).replace(tzinfo=timezone.utc)
-        since_ms = int(sent_time.timestamp() * 1000)
-        o,h,l,c,v = fetch_ohlcv_safe(exchange_instance, sym_ccxt, "1m", limit=1000, since=since_ms)
-        if o is None:
-            price = fetch_ticker_safe(exchange_instance, sym_ccxt)
-            if price is None:
-                return {"status":"unknown","hit_time":None,"hit_price":None}
-            # evaluate by current price
-            if record["side"] == "LONG":
-                if price >= record["tp2"]: return {"status":"tp2","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":price}
-                if price >= record["tp1"]: return {"status":"tp1","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":price}
-                if price <= record["sl"]: return {"status":"sl","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":price}
-                return {"status":"open","hit_time":None,"hit_price":price}
-            else:
-                if price <= record["tp2"]: return {"status":"tp2","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":price}
-                if price <= record["tp1"]: return {"status":"tp1","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":price}
-                if price >= record["sl"]: return {"status":"sl","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":price}
-                return {"status":"open","hit_time":None,"hit_price":price}
-
-        highs = np.array(h).astype(float)
-        lows = np.array(l).astype(float)
-        for i in range(len(highs)):
-            hh = float(highs[i]); ll = float(lows[i])
-            if record["side"] == "LONG":
-                if hh >= record["tp2"]:
-                    return {"status":"tp2","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":record["tp2"]}
-                if hh >= record["tp1"]:
-                    return {"status":"tp1","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":record["tp1"]}
-                if ll <= record["sl"]:
-                    return {"status":"sl","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":record["sl"]}
-            else:
-                if ll <= record["tp2"]:
-                    return {"status":"tp2","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":record["tp2"]}
-                if ll <= record["tp1"]:
-                    return {"status":"tp1","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":record["tp1"]}
-                if hh >= record["sl"]:
-                    return {"status":"sl","hit_time":datetime.now(timezone.utc).isoformat(),"hit_price":record["sl"]}
-        current = fetch_ticker_safe(exchange_instance, sym_ccxt)
-        return {"status":"open","hit_time":None,"hit_price":current}
-    except Exception as e:
-        logging.exception("check_signal_status error: %s", e)
-        return {"status":"unknown","hit_time":None,"hit_price":None}
-
-# ----------------------------
-# SUMMARY WORKER (6H) with local archiver
-# ----------------------------
-def next_scheduled_run(now_utc):
-    today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    candidates = []
-    for d in [0,1]:
-        base = today + timedelta(days=d)
-        for h in SUMMARY_HOURS_UTC:
-            candidates.append(base + timedelta(hours=h))
-    candidates = sorted(candidates)
-    for c in candidates:
-        if c > now_utc:
-            return c
-    return now_utc + timedelta(hours=6)
-
-def build_and_send_6h_summary():
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(hours=6)
-    signals = load_signals()
-    window = [r for r in signals if datetime.fromisoformat(r["time"]).replace(tzinfo=timezone.utc) > since]
-    if not window:
-        logging.info("Summary: no signals in the 6h window.")
-        return
-
-    report_entries = []
-    counts = {"tp2":0,"tp1":0,"sl":0,"open":0,"unknown":0}
-    for rec in window:
-        st = check_signal_status(rec)
-        # normalize status key
-        s_key = st.get("status") or "unknown"
-        counts[s_key] = counts.get(s_key,0) + 1
-        report_entries.append({
-            "symbol": rec["symbol"].replace("/USDT","/USDT.P"),
-            "side": rec.get("side"),
-            "sent_time": rec.get("time"),
-            "status": s_key,
-            "hit_time": st.get("hit_time"),
-            "hit_price": st.get("hit_price"),
-            "entry": rec.get("entry"),
-            "sl": rec.get("sl"),
-            "tp1": rec.get("tp1"),
-            "tp2": rec.get("tp2"),
-            "kind": rec.get("kind","?"),
-            "note": rec.get("note","")
-        })
-
-    header = f"📈 WSS 6H Report — {since.strftime('%Y-%m-%d %H:%M')} → {now.strftime('%Y-%m-%d %H:%M')} UTC\n"
-    lines = [header]
-    idx = 1
-    for e in report_entries:
-        status_icon = {"tp2":"✅ TP2","tp1":"🟡 TP1","sl":"🔴 SL","open":"⚪ OPEN","unknown":"❓"}.get(e["status"], "❓")
-        lines.append(f"{idx}) {e['symbol']} — {e['side']} | Kind: {e.get('kind','?')} | {status_icon} | Sent: {e['sent_time']}")
-        if e.get("hit_time"):
-            lines.append(f"    Hit time: {e['hit_time']} | Price: {e.get('hit_price')}")
-        else:
-            lines.append(f"    Entry: {e['entry']} | SL: {e['sl']} | TP1: {e['tp1']} | TP2: {e['tp2']}")
-        if e.get("note"):
-            lines.append(f"    Note: {e['note']}")
-        idx += 1
-
-    lines.append("")
-    lines.append(f"Summary counts — TP2: {counts.get('tp2',0)} | TP1: {counts.get('tp1',0)} | SL: {counts.get('sl',0)} | OPEN: {counts.get('open',0)}")
-
-    send_telegram_text("\n".join(lines))
-
-    # save JSON
-    try:
-        os.makedirs("reports", exist_ok=True)
-        filename = f"reports/report_{now.strftime('%Y-%m-%d_%HUTC')}.json"
-        report_data = {"start": since.isoformat(), "end": now.isoformat(), "entries": report_entries, "counts": counts}
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(report_data, f, ensure_ascii=False, indent=2)
-        logging.info("Saved summary report to %s", filename)
-    except Exception as e:
-        logging.warning("Failed to save summary report: %s", e)
-
-# ------------------------------------------------------------
-# Finish Part 2 here. Next message will contain Part 3 (workers, main loop, flask keepalive, startup)
-# ------------------------------------------------------------
-# ============================================================
-# PART 3 — Workers, Main loop, Flask keepalive, Startup
-# ============================================================
-
-# ---------- SUMMARY WORKER ----------
-def summary_worker():
-    """
-    Runs the 6-hour summary report automatically.
-    Sleeps until the next UTC checkpoint (00:00, 06:00, 12:00, 18:00),
-    then generates and sends the report to Telegram and saves JSON locally.
-    """
-    while True:
-        try:
-            now_utc = datetime.now(timezone.utc)
-            nxt = next_scheduled_run(now_utc)
-            wait_sec = (nxt - now_utc).total_seconds()
-            logging.info("Summary worker sleeping until %s UTC (%.0f s)", nxt.strftime("%Y-%m-%d %H:%M"), wait_sec)
-            # guard against tiny waits
-            time.sleep(max(30, wait_sec))
-            build_and_send_6h_summary()
-            logging.info("6-hour summary executed at %s UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
-            # small cool-down
-            time.sleep(5)
-        except Exception as e:
-            logging.exception("summary_worker error: %s", e)
-            time.sleep(300)
-
-# ---------- DAILY REPORT WORKER ----------
-def build_and_send_daily_report():
-    try:
-        now = datetime.now(timezone.utc)
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(days=1)
-        os.makedirs("reports", exist_ok=True)
-        os.makedirs("daily_reports", exist_ok=True)
-
-        report_files = [f for f in os.listdir("reports") if f.startswith("report_")]
-        daily_entries = []
-        counts = {"tp2":0, "tp1":0, "sl":0, "open":0, "unknown":0}
-        for rf in report_files:
-            fp = os.path.join("reports", rf)
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                start_t = datetime.fromisoformat(data["start"]).replace(tzinfo=timezone.utc)
-                if start_t >= day_start and start_t < day_end:
-                    for e in data.get("entries", []):
-                        daily_entries.append(e)
-                        st = e.get("status","unknown")
-                        if st in counts:
-                            counts[st] += 1
-            except Exception as e:
-                logging.warning("Failed parse %s: %s", rf, e)
-
-        if not daily_entries:
-            logging.info("Daily report: no entries found for today.")
-            return
-
-        total = len(daily_entries)
-        win_rate = 0.0
-        if total > 0:
-            win_rate = 100.0 * (counts.get("tp1",0) + counts.get("tp2",0)) / total
-
-        note_stats = {}
-        for e in daily_entries:
-            note = e.get("note","").strip() or "unknown"
-            st = e.get("status","unknown")
-            ns = note_stats.setdefault(note, {"total":0, "wins":0})
-            ns["total"] += 1
-            if st in ("tp1","tp2"):
-                ns["wins"] += 1
-
-        sorted_notes = sorted(note_stats.items(), key=lambda x: x[1]["wins"], reverse=True)[:6]
-
-        lines = []
-        lines.append(f"📊 WSS Daily Master Report — {day_start.strftime('%Y-%m-%d')} UTC\n")
-        lines.append(f"Total signals: {total}")
-        lines.append(f"✅ TP2: {counts.get('tp2',0)} | 🟡 TP1: {counts.get('tp1',0)} | 🔴 SL: {counts.get('sl',0)} | ⚪ OPEN: {counts.get('open',0)}")
-        lines.append(f"Win Rate (TP1+TP2): {round(win_rate,1)}%\n")
-        lines.append("Top performing setups:")
-        for n,v in sorted_notes:
-            success = 0.0
-            if v["total"] > 0:
-                success = 100.0 * v["wins"] / v["total"]
-            lines.append(f"- {n[:70]} → {round(success,1)}%")
-        send_telegram_text("\n".join(lines))
-
-        fn = f"daily_reports/report_{day_start.strftime('%Y-%m-%d')}.json"
-        try:
-            with open(fn, "w", encoding="utf-8") as f:
-                json.dump({"date": day_start.isoformat(), "counts": counts, "entries": daily_entries, "note_stats": note_stats, "win_rate": win_rate}, f, ensure_ascii=False, indent=2)
-            logging.info("Saved daily report to %s", fn)
-        except Exception as e:
-            logging.warning("Failed to save daily report: %s", e)
-    except Exception as e:
-        logging.exception("build_and_send_daily_report error: %s", e)
-
-def daily_report_worker():
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            # next midnight UTC + small buffer
-            next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
-            wait = (next_midnight - now).total_seconds()
-            logging.info("Daily report worker sleeping until midnight UTC (%.0fs)", wait)
-            time.sleep(max(60, wait))
-            build_and_send_daily_report()
-            # small delay after sending
-            time.sleep(10)
-        except Exception as e:
-            logging.exception("daily_report_worker error: %s", e)
-            time.sleep(60)
-
-# ---------- HEARTBEAT & SILENCE MONITORS ----------
-def heartbeat_worker():
-    while True:
-        try:
-            nxt = next_scheduled_run(datetime.now(timezone.utc))
-            logging.info("[Heartbeat] Bot alive — next summary at %s", nxt.strftime("%Y-%m-%d %H:%M"))
-            time.sleep(HEARTBEAT_INTERVAL)
-        except Exception as e:
-            logging.exception("heartbeat_worker error: %s", e)
-            time.sleep(60)
-
-def silence_monitor():
-    while True:
-        try:
-            arr = load_signals()
-            if not arr:
-                time.sleep(SILENCE_ALERT_HOURS * 3600)
-                continue
-            last_time = datetime.fromisoformat(arr[-1]["time"]).replace(tzinfo=timezone.utc)
-            delta = datetime.now(timezone.utc) - last_time
-            if delta.total_seconds() >= SILENCE_ALERT_HOURS * 3600:
-                send_telegram_text(f"⏳ No valid signals found in the last {SILENCE_ALERT_HOURS} hours. Market quiet.")
-            time.sleep(SILENCE_ALERT_HOURS * 3600)
-        except Exception as e:
-            logging.exception("silence_monitor error: %s", e)
-            time.sleep(300)
-
-# ---------- EXCHANGE INITIALIZATION ----------
-def init_exchange():
+def init_exchange() -> Optional[ccxt.Exchange]:
+    global exchange_instance
+    if exchange_instance is not None:
+        return exchange_instance
     try:
         ex = ccxt.mexc({
             "apiKey": MEXC_API_KEY,
@@ -743,113 +57,416 @@ def init_exchange():
             "options": {"defaultType": "future"}
         })
         ex.load_markets(True)
-        logging.info("Connected to MEXC Futures API (read-only).")
-        send_telegram_text("✅ Connected to MEXC Futures API (read-only).")
+        exchange_instance = ex
+        logger.info("Connected to MEXC Futures API (read-only).")
+        tg_send(f"✅ Connected to MEXC Futures API (read-only).")
         return ex
     except Exception as e:
-        logging.exception("init_exchange failed: %s", e)
-        send_telegram_text(f"❌ MEXC connection failed: {e}")
+        logger.exception("init_exchange failed: %s", e)
+        tg_send(f"❌ MEXC connection failed: {e}")
         return None
+
+# ---------- Telegram helper (simple retry) ----------
+def tg_send(text: str) -> bool:
+    """Send a Telegram text message simple wrapper. Retries a couple times on failure."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.debug("Telegram not configured. Message not sent.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    tries = 0
+    while tries < 4:
+        try:
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                logger.info("TG sent: %s", text.splitlines()[0] if text else "<empty>")
+                return True
+            else:
+                # handle rate limit 429 gracefully
+                if r.status_code == 429:
+                    wait = int(r.headers.get("Retry-After", "10"))
+                    logger.warning("TG rate limited. Sleep %s", wait)
+                    time.sleep(wait + 1)
+                else:
+                    logger.warning("TG send failed %s: %s", r.status_code, r.text[:200])
+        except Exception as e:
+            logger.warning("TG send exception: %s", e)
+        tries += 1
+        time.sleep(1 + tries)
+    return False
+
+# convenience alias
+send_telegram_text = tg_send
+
+# ---------- Utilities ----------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def iso_now() -> str:
+    return now_utc().isoformat()
+
+def next_scheduled_run(from_dt: datetime) -> datetime:
+    # compute next UTC checkpoint among SUMMARY_CHECKPOINTS (0,6,12,18)
+    hour = from_dt.hour
+    for cp in SUMMARY_CHECKPOINTS:
+        if hour < cp or (hour == cp and from_dt.minute == 0 and from_dt.second < 5):
+            return from_dt.replace(hour=cp, minute=0, second=5, microsecond=0)
+    # next day first checkpoint
+    nxt = (from_dt + timedelta(days=1)).replace(hour=SUMMARY_CHECKPOINTS[0], minute=0, second=5, microsecond=0)
+    return nxt
+
+# ---------- Signal storage helpers ----------
+def signals_file_path() -> str:
+    return os.path.join("signals", "signals.json")
+
+def load_signals() -> List[Dict[str,Any]]:
+    fp = signals_file_path()
+    if not os.path.exists(fp):
+        return []
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        logger.warning("Failed load_signals: %s", e)
+        return []
+
+def save_signal(rec: Dict[str,Any]) -> None:
+    arr = load_signals()
+    arr.append(rec)
+    try:
+        with open(signals_file_path(), "w", encoding="utf-8") as f:
+            json.dump(arr[-1000:], f, ensure_ascii=False, indent=2)  # keep last 1000
+    except Exception as e:
+        logger.warning("Failed save_signal: %s", e)
+
+# ---------- Formatting helpers ----------
+def format_pair_for_msg(symbol: str) -> str:
+    # convert "BTC/USDT" -> "BTC/USDT.P" for user readability
+    if symbol.endswith("/USDT"):
+        return symbol.replace("/USDT", "/USDT.P")
+    return symbol
+
+def format_trade_text(rec: Dict[str,Any], kind: str="CONFIRMED") -> str:
+    # rec expected to have fields: symbol, side, entry, sl, tp1, tp2, rsi15, timeframe_info, leverage
+    symbol = format_pair_for_msg(rec.get("symbol","?"))
+    side = rec.get("side","?")
+    entry = rec.get("entry")
+    sl = rec.get("sl")
+    tp1 = rec.get("tp1")
+    tp2 = rec.get("tp2")
+    rsi15 = rec.get("rsi15")
+    lev = rec.get("leverage", "50x")
+    ts = rec.get("time", iso_now())
+    lines = []
+    header = "🟢 SIGNAL" if kind=="CONFIRMED" else ("🟡 NEAR" if kind=="NEAR" else "🟡 PRE-SIGNAL")
+    lines.append(f"{header} — {symbol} — {side}")
+    lines.append(f"ENTRY: {entry}")
+    lines.append(f"SL: {sl}")
+    lines.append(f"TP1: {tp1} | TP2: {tp2}")
+    lines.append(f"RSI(15m): {rsi15} | LEVERAGE: {lev}")
+    lines.append(f"TIME: {ts} UTC")
+    lines.append("\n⚠️ هذا تحليل فقط — لا أوامر تلقائية. تأكد من السيولة، الانزلاق، والعمولات قبل التنفيذ.")
+    return "\n".join(lines)
+
+# ---------- Simple persistence for reports (6H / daily) ----------
+def save_6h_report(report_data: Dict[str,Any]) -> str:
+    now = now_utc()
+    fn = f"reports/report_{now.strftime('%Y-%m-%d_%HUTC')}.json"
+    try:
+        with open(fn, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+        logger.info("Saved summary report to %s", fn)
+        return fn
+    except Exception as e:
+        logger.warning("Failed save_6h_report: %s", e)
+        return ""
+
+# ============================
+# End of Part 1/3
+# (Next: Part 2/3 — market analysis functions, EMA/RSI calculations, pattern checks, signal classification)
+# ============================
+# ============================
+# WSSv-Full — main.py (Part 2/3)
+# Market analysis, EMA/RSI logic, pattern detection, classification
+# ============================
+
+import numpy as np
+
+# ---------- Technical calculations ----------
+def ema(values: np.ndarray, period: int) -> float:
+    """Simple EMA using numpy for last N candles."""
+    if len(values) < period:
+        return np.mean(values)
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    a = np.convolve(values, weights, mode='full')[:len(values)]
+    return a[-1]
+
+def calc_rsi(closes: np.ndarray, period: int = 14) -> float:
+    deltas = np.diff(closes)
+    gain = np.where(deltas > 0, deltas, 0)
+    loss = np.where(deltas < 0, -deltas, 0)
+    avg_gain = np.mean(gain[-period:])
+    avg_loss = np.mean(loss[-period:])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+# ---------- Pattern detection ----------
+def detect_reversal_candle(ohlcv: list) -> bool:
+    """Detects doji / hammer / shooting star type candles."""
+    try:
+        open_, high, low, close = ohlcv[-1][1:5]
+        body = abs(close - open_)
+        range_ = high - low
+        if range_ == 0:
+            return False
+        body_ratio = body / range_
+        upper_wick = high - max(open_, close)
+        lower_wick = min(open_, close) - low
+
+        # Doji-like
+        if body_ratio < 0.15:
+            return True
+        # Hammer / Shooting star
+        if lower_wick > body * 2.5 or upper_wick > body * 2.5:
+            return True
+        return False
+    except Exception:
+        return False
+
+def detect_fvg(ohlcv: list) -> bool:
+    """Detect Fair Value Gap by comparing highs/lows of last 3 candles."""
+    if len(ohlcv) < 3:
+        return False
+    h1, l1 = ohlcv[-3][2], ohlcv[-3][3]
+    h2, l2 = ohlcv[-2][2], ohlcv[-2][3]
+    h3, l3 = ohlcv[-1][2], ohlcv[-1][3]
+    # Gap exists if l1 > h3 or h1 < l3
+    if l1 > h3 or h1 < l3:
+        return True
+    return False
+
+# ---------- Market scan ----------
+def analyze_market_symbol(ex, symbol: str, timeframe: str = "15m") -> dict:
+    """Perform full analysis on a single symbol: EMA, RSI, FVG, patterns."""
+    try:
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe, limit=60)
+        closes = np.array([c[4] for c in ohlcv])
+        ema20 = ema(closes, 20)
+        ema50 = ema(closes, 50)
+        rsi_val = calc_rsi(closes)
+
+        trend = "bull" if ema20 > ema50 else "bear"
+        reversal = detect_reversal_candle(ohlcv)
+        fvg = detect_fvg(ohlcv)
+        price = closes[-1]
+        diff = abs(ema20 - ema50) / ema50
+
+        # ICT / SMC logic (simplified)
+        ob_confirmed = fvg or reversal
+
+        # Classify signal
+        if (ema20 > ema50 and rsi_val > 55) or (ema20 < ema50 and rsi_val < 45):
+            kind = "CONFIRMED"
+        elif diff < 0.0015 and 45 <= rsi_val <= 55:
+            kind = "PRE"
+        else:
+            kind = "NEAR"
+
+        return {
+            "symbol": symbol,
+            "price": price,
+            "ema20": ema20,
+            "ema50": ema50,
+            "rsi15": rsi_val,
+            "trend": trend,
+            "reversal": reversal,
+            "fvg": fvg,
+            "ob": ob_confirmed,
+            "kind": kind,
+            "time": iso_now()
+        }
+    except Exception as e:
+        logger.warning(f"analyze_market_symbol {symbol} failed: {e}")
+        return {}
+
+# ---------- Combined scanner ----------
+def analyze_all_symbols(symbols: list[str], timeframe: str = "15m") -> list[dict]:
+    ex = init_exchange()
+    results = []
+    if ex is None:
+        return results
+    for sym in symbols:
+        if not sym.endswith("/USDT"):
+            continue
+        rec = analyze_market_symbol(ex, sym, timeframe)
+        if rec:
+            results.append(rec)
+            # إرسال صفقات مؤكدة أو قريبة
+            if rec["kind"] in ("CONFIRMED", "NEAR"):
+                txt = format_trade_text({
+                    "symbol": rec["symbol"],
+                    "side": "LONG" if rec["trend"] == "bull" else "SHORT",
+                    "entry": f"{rec['price']:.6f}",
+                    "sl": f"{rec['price'] * (0.99 if rec['trend']=='bull' else 1.01):.6f}",
+                    "tp1": f"{rec['price'] * (1.015 if rec['trend']=='bull' else 0.985):.6f}",
+                    "tp2": f"{rec['price'] * (1.03 if rec['trend']=='bull' else 0.97):.6f}",
+                    "rsi15": rec["rsi15"],
+                    "leverage": "50x"
+                }, rec["kind"])
+                send_telegram_text(txt)
+                save_signal(rec)
+    return results
+
+# ---------- Warm-up logic ----------
+def warmup_analysis(symbols: list[str]) -> None:
+    send_telegram_text("🧠 Warm-up: Running deep pre-cycle analysis...")
+    ex = init_exchange()
+    if ex is None:
+        return
+    for _ in range(3):  # 3 passes
+        logger.info("🔁 Pre-cycle deep scan running...")
+        analyze_all_symbols(symbols, "15m")
+        analyze_all_symbols(symbols, "30m")
+        time.sleep(20)
+    send_telegram_text("✅ Warm-up complete — first active cycle starting now.")
+
+# ============================
+# End of Part 2/3
+# (Next: Part 3/3 — main loop, report builders, Flask app)
+# ============================
+# ============================
+# WSSv-Full — main.py (Part 3/3)
+# Core loop, workers, summaries, Flask keepalive, startup
+# ============================
+
+def build_and_send_6h_summary():
+    """يبعت ملخص آخر 6 ساعات."""
+    try:
+        signals = load_signals()
+        if not signals:
+            logger.info("No signals yet for 6H summary.")
+            return
+
+        now = now_utc()
+        since = now - timedelta(hours=6)
+        subset = [r for r in signals if datetime.fromisoformat(r["time"]).replace(tzinfo=timezone.utc) > since]
+
+        if not subset:
+            logger.info("Summary window empty.")
+            return
+
+        counts = {"CONFIRMED":0, "NEAR":0, "PRE":0}
+        for r in subset:
+            counts[r.get("kind","PRE")] = counts.get(r.get("kind","PRE"),0) + 1
+
+        msg = [f"📈 WSS 6H Summary — {since.strftime('%H:%M')} → {now.strftime('%H:%M')} UTC"]
+        msg.append(f"✅ CONFIRMED: {counts['CONFIRMED']} | 🟡 NEAR: {counts['NEAR']} | ⚪ PRE: {counts['PRE']}")
+        msg.append(f"Total: {len(subset)} signals monitored.")
+        send_telegram_text("\n".join(msg))
+        save_6h_report({"start":since.isoformat(),"end":now.isoformat(),"counts":counts,"signals":subset})
+    except Exception as e:
+        logger.warning(f"build_and_send_6h_summary failed: {e}")
+
+def daily_report():
+    """تقرير يومي عام كل 00:00 UTC."""
+    try:
+        now = now_utc()
+        day = now.strftime("%Y-%m-%d")
+        signals = load_signals()
+        today = [s for s in signals if s["time"].startswith(day)]
+        if not today:
+            return
+        kinds = {}
+        for s in today:
+            k = s.get("kind","PRE")
+            kinds[k] = kinds.get(k,0) + 1
+        lines = [
+            f"📊 WSS Daily Report — {day}",
+            f"✅ CONFIRMED: {kinds.get('CONFIRMED',0)} | 🟡 NEAR: {kinds.get('NEAR',0)} | ⚪ PRE: {kinds.get('PRE',0)}",
+            f"Total: {len(today)} signals logged."
+        ]
+        send_telegram_text("\n".join(lines))
+        with open(f"daily_reports/{day}.json","w",encoding="utf-8") as f:
+            json.dump({"day":day,"kinds":kinds,"signals":today},f,ensure_ascii=False,indent=2)
+    except Exception as e:
+        logger.warning(f"daily_report failed: {e}")
+
+def heartbeat_worker():
+    """يبعت كل ساعة تأكيد إن البوت شغال."""
+    while True:
+        try:
+            nxt = next_scheduled_run(now_utc())
+            logger.info("[Heartbeat] Bot alive — next summary at %s", nxt.strftime("%Y-%m-%d %H:%M"))
+            time.sleep(HEARTBEAT_INTERVAL)
+        except Exception as e:
+            logger.warning("heartbeat_worker error: %s", e)
+            time.sleep(60)
+
+def silence_monitor():
+    """لو مفيش إشارات لفترة طويلة يرسل تنبيه."""
+    while True:
+        try:
+            signals = load_signals()
+            if not signals:
+                time.sleep(SILENCE_ALERT_HOURS * 3600)
+                continue
+            last_time = datetime.fromisoformat(signals[-1]["time"]).replace(tzinfo=timezone.utc)
+            delta = now_utc() - last_time
+            if delta.total_seconds() > SILENCE_ALERT_HOURS * 3600:
+                send_telegram_text(f"⏳ No signals for {SILENCE_ALERT_HOURS}h. Market is quiet.")
+            time.sleep(SILENCE_ALERT_HOURS * 3600)
+        except Exception as e:
+            logger.warning("silence_monitor error: %s", e)
+            time.sleep(300)
 
 # ---------- MAIN LOOP ----------
 def main_loop():
-    global exchange_instance
     ex = init_exchange()
-    if not ex:
-        logging.error("Exchange init failed, exiting main loop.")
+    if ex is None:
+        logger.error("Exchange init failed.")
         return
-    exchange_instance = ex
+    markets = ex.load_markets()
+    symbols = [s for s in markets.keys() if s.endswith("/USDT")][:MAX_SYMBOLS]
 
-    try:
-        markets = ex.load_markets()
-        # build symbol list filtered to USDT perpetuals typical naming
-        all_symbols = [s for s in markets.keys() if s.endswith("/USDT") or s.endswith(":USDT")]
-        symbols = all_symbols[:MAX_SYMBOLS]
-    except Exception as e:
-        logging.exception("Failed to load markets: %s", e)
-        symbols = []
-
-    logging.info("Monitoring %d symbols. Risk per trade: $%s", len(symbols), RISK_USD)
     send_telegram_text(f"🚀 WSS Analytical running — monitoring {len(symbols)} symbols. Risk ${RISK_USD}")
-    send_telegram_text("🧠 Warm-up: Running initial deep analysis for first cycle...")
-    time.sleep(5)
-    # Force extended warm-up scan to refine EMA and RSI before first cycle
-     for _ in range(3):  # ثلاث مرات تحليل تمهيدي
-    logging.info("🔁 Pre-cycle deep scan running...")
-    analyze_markets(symbols, timeframe="15m")
-    analyze_markets(symbols, timeframe="30m")
-    time.sleep(20)
-    send_telegram_text("✅ Warm-up complete — first active cycle starting now.")
+    warmup_analysis(symbols)  # التحليل المسبق قبل الدورة الأولى
+    send_telegram_text("⚙️ Starting continuous market monitoring...")
 
-    # start background workers
-    threading.Thread(target=summary_worker, daemon=True).start()
-    threading.Thread(target=heartbeat_worker, daemon=True).start()
-    threading.Thread(target=silence_monitor, daemon=True).start()
-    threading.Thread(target=daily_report_worker, daemon=True).start()
-
-    cycle_index = 0
+    cycle = 0
     while True:
-        cycle_index += 1
-        start_time = time.time()
-        scanned = 0
-        confirmed_list, near_list, pre_list = [], [], []
-        sent_count = 0
+        try:
+            cycle += 1
+            logger.info("Cycle #%d started — scanning markets.", cycle)
+            results = analyze_all_symbols(symbols, "15m")
 
-        for s in symbols:
-            scanned += 1
-            try:
-                out = evaluate_symbol(ex, s)
-                if not out:
-                    continue
-                status = out.get("status")
-                if status == "confirmed":
-                    ok = send_and_store(out, kind="CONFIRMED")
-                    if ok:
-                        confirmed_list.append(out)
-                        sent_count += 1
-                elif status == "near":
-                    ok = send_and_store(out, kind="NEAR")
-                    if ok:
-                        near_list.append(out)
-                        sent_count += 1
-                elif status == "pre":
-                    txt = format_trade_text(out, kind="PRE")
-                    send_telegram_text(txt)
-                    pre_list.append(out)
-                # slight delay to respect rate limit
-                time.sleep(0.12)
-            except Exception as e:
-                logging.debug("Error evaluating %s: %s", s, e)
-                continue
+            confirmed = len([r for r in results if r.get("kind") == "CONFIRMED"])
+            near = len([r for r in results if r.get("kind") == "NEAR"])
+            pre = len([r for r in results if r.get("kind") == "PRE"])
+            summary = f"📊 Cycle #{cycle} — CONFIRMED: {confirmed} | NEAR: {near} | PRE: {pre} | Total: {len(results)}"
+            send_telegram_text(summary)
 
-        duration = int(time.time() - start_time)
-        summary_msg = (
-            f"📊 Cycle done — Scanned: {scanned} | Confirmed: {len(confirmed_list)} | "
-            f"Near: {len(near_list)} | Pre: {len(pre_list)} | Duration: {duration}s\n\n"
-            f"Cycle: #{cycle_index}  | Sent: {sent_count} (Confirmed+Near)"
-        )
-        logging.info(summary_msg)
-        send_telegram_text(summary_msg)
-
-        # preview messages (short)
-        preview_lines = []
-        for c in confirmed_list[:6]:
-            preview_lines.append(f"✅ {c['symbol'].replace('/USDT','/USDT.P')} {c['side']} ENTRY:{round(c['entry'],8)}")
-        for n in near_list[:6]:
-            preview_lines.append(f"🟡 {n['symbol'].replace('/USDT','/USDT.P')} {n['side']} ENTRY:{round(n['entry'],8)}")
-        if preview_lines:
-            send_telegram_text("\n".join(preview_lines))
-
-        # sleep until next cycle
-        to_wait = max(0, INTERVAL_SECONDS - duration)
-        logging.info("Cycle #%d finished, sleeping for %d seconds", cycle_index, to_wait)
-        time.sleep(to_wait)
+            build_and_send_6h_summary()  # تقارير كل 6 ساعات
+            time.sleep(INTERVAL_SECONDS)
+        except Exception as e:
+            logger.warning("main_loop error: %s", e)
+            time.sleep(30)
 
 # ---------- FLASK KEEPALIVE ----------
 app = Flask(__name__)
+
 @app.route("/")
 def home():
-    return jsonify({"service":"WSS","status":"running","time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({
+        "service": "WSSv-Full",
+        "status": "running",
+        "time": now_utc().isoformat()
+    })
 
 def run_flask():
     port = int(os.getenv("PORT", "10000"))
@@ -859,7 +476,6 @@ def render_ping():
     port = int(os.getenv("PORT", "10000"))
     while True:
         try:
-            # local ping to keep Render/Replit alive
             requests.get(f"http://localhost:{port}", timeout=2)
         except:
             pass
@@ -867,23 +483,11 @@ def render_ping():
 
 # ---------- STARTUP ----------
 if __name__ == "__main__":
-    try:
-        # start flask and ping threads
-        threading.Thread(target=run_flask, daemon=True).start()
-        threading.Thread(target=render_ping, daemon=True).start()
-        time.sleep(3)
-        send_telegram_text("✅ WSS Analytical Bot (v7.3) restarted and fully live. Starting main analysis loop...")
-        # initial 6H summary on startup (safe-guard)
-        try:
-            build_and_send_6h_summary()
-            logging.info("Initial 6H summary executed successfully at startup.")
-        except Exception as e:
-            logging.warning("Initial 6H summary failed: %s", e)
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=render_ping, daemon=True).start()
+    threading.Thread(target=heartbeat_worker, daemon=True).start()
+    threading.Thread(target=silence_monitor, daemon=True).start()
 
-        # run main loop
-        main_loop()
-    except Exception as e:
-        logging.exception("Fatal startup error: %s", e)
-
-
-
+    time.sleep(3)
+    send_telegram_text("✅ WSS Full Analytical System started and live.")
+    main_loop()
