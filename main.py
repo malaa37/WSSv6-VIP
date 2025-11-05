@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-# WSS v6.5 — Smart Monitor Edition
-# شامل كل التعديلات النهائية + مراقب الصمت 3 ساعات + تقارير + Heartbeat + تحليل لحظي
+# WSS v6.6 — Smart Monitor + Keepalive Edition
+# شامل كل التعديلات السابقة + إصلاح توقف Render + إشارات محسّنة + مراقبة صمت + تقارير 6 ساعات + Heartbeat
 
-import os, time, json, logging, threading
+import os, time, json, logging, threading, requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify
 import numpy as np
 import ccxt
 import telebot
-import requests
 
 # ================= CONFIG =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -17,7 +16,7 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
 
 DEFAULT_LEVERAGE = 50
-INTERVAL_SECONDS = 900  # تحليل كل 15 دقيقة
+INTERVAL_SECONDS = 900  # كل 15 دقيقة
 SUMMARY_HOURS_UTC = [0, 6, 12, 18]
 HEARTBEAT_INTERVAL = 3600  # كل ساعة
 RISK_USD = 10
@@ -73,13 +72,6 @@ def fetch_ohlcv_safe(ex, symbol, timeframe, limit=200):
         logging.debug(f"Fetch error {symbol} {timeframe}: {e}")
         return None, None, None, None, None
 
-def fetch_ticker_safe(ex, symbol):
-    try:
-        t = ex.fetch_ticker(symbol)
-        return float(t.get("last") or t.get("close") or 0.0)
-    except:
-        return None
-
 # ================= INDICATORS =================
 def ema(series, period):
     s = np.asarray(series, dtype=float)
@@ -133,7 +125,7 @@ def evaluate_symbol(ex, sym):
 
     return {"symbol": sym, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rsi": rsi_now}
 
-# ================= SIGNAL MANAGEMENT =================
+# ================= SIGNALS =================
 def append_signal(rec):
     try:
         if not os.path.exists(SIGNALS_LOG_FILE):
@@ -158,7 +150,7 @@ def send_signal(out):
     out["time"] = datetime.now(timezone.utc).isoformat()
     append_signal(out)
 
-# ================= SUMMARY + HEARTBEAT =================
+# ================= SCHEDULED TASKS =================
 def next_scheduled_run(now):
     base = now.replace(hour=0, minute=0, second=0, microsecond=0)
     for d in range(2):
@@ -175,10 +167,7 @@ def summary_worker(ex):
         wait = (nxt - now).total_seconds()
         logging.info(f"Summary worker: next run at {nxt} (in {int(wait)}s)")
         time.sleep(wait)
-        try:
-            send_telegram_text(f"📊 6H Summary Check — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\nNo new TP/SL data yet.")
-        except Exception as e:
-            logging.warning(f"Summary error: {e}")
+        send_telegram_text(f"📊 6H Summary Check — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\nNo new TP/SL data yet.")
         time.sleep(2)
 
 def heartbeat_worker():
@@ -188,7 +177,6 @@ def heartbeat_worker():
         logging.info(msg)
         time.sleep(HEARTBEAT_INTERVAL)
 
-# ================= SMART SILENCE MONITOR =================
 def silence_monitor():
     while True:
         try:
@@ -231,17 +219,29 @@ def main_loop():
         logging.info(f"Cycle done — Sent {cnt} signals")
         time.sleep(INTERVAL_SECONDS)
 
-# ================= FLASK SERVER =================
+# ================= FLASK KEEPALIVE =================
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return jsonify({"service": "WSS", "status": "running", "time": datetime.now(timezone.utc).isoformat()})
+
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","10000")))
 
 # ================= START =================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
+    # Ping for Render readiness
+    def render_ping():
+        while True:
+            try:
+                requests.get("http://localhost:" + os.getenv("PORT", "10000"))
+            except:
+                pass
+            time.sleep(10)
+    threading.Thread(target=render_ping, daemon=True).start()
+
     time.sleep(5)
     send_telegram_text("✅ WSS Analytical Bot restarted and fully live. Starting main analysis loop...")
     try:
