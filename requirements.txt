@@ -1,5 +1,7 @@
 ccxt
 numpy
-python-dotenv
 pyTelegramBotAPI
 flask
+requests
+python-dateutil
+pandas
