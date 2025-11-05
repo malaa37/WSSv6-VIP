@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-# WSS v6.2 + Fix Render Thread + Heartbeat
-# يعمل على MEXC Futures (read-only)
-# إشارات لحظية + تقارير 6 ساعات + Heartbeat كل ساعة
-# لا ينفذ أوامر حقيقية، تحليل فقط
+# WSS v6.3 Final Stable Edition
+# تحليل لحظي + تقارير مجمعة + Heartbeat + تحسين الاتصالات
+# مخصص لمنصة MEXC Futures (read-only)
 
 import os
 import time
@@ -10,90 +9,64 @@ import json
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from math import isclose
+import numpy as np
 from flask import Flask, jsonify
+import ccxt
+import telebot
 
-try:
-    import ccxt
-    import numpy as np
-    import telebot
-    import requests
-except Exception as e:
-    print("Missing dependency:", e)
-
-# ========== CONFIG ==========
+# =================== CONFIG ===================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
 
 DEFAULT_LEVERAGE = 50
-MAX_SYMBOLS = 60
-MIN_VOLUME_USD = 500
-INTERVAL_SECONDS = 900  # تحليل كل 15 دقيقة
-RISK_USD = 10
+INTERVAL_SECONDS = 900  # كل 15 دقيقة
 SUMMARY_HOURS_UTC = [0, 6, 12, 18]
-PING_URL = os.getenv("PING_URL", "").strip()
-SIGNALS_LOG_FILE = "signals_log.json"
 HEARTBEAT_INTERVAL = 3600  # كل ساعة
+RISK_USD = 10
+MAX_SYMBOLS = 60
+SIGNALS_LOG_FILE = "signals_log.json"
 
-# ========== LOGGING ==========
+# =================== LOGGING ===================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logging.getLogger("ccxt").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-# ========== TELEGRAM ==========
-bot = None
-if TELEGRAM_TOKEN:
-    try:
-        bot = telebot.TeleBot(TELEGRAM_TOKEN)
-        logging.info("Telegram bot initialized.")
-    except Exception as e:
-        logging.warning("Telegram init failed: %s", e)
+# =================== TELEGRAM ===================
+bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
 def send_telegram_text(text: str):
     footer = "\n\n⚠️ هذا تحليل فقط — لا أوامر تلقائية. نفّذ يدويًا ومراعاة الانزلاق والسيولة."
-    payload = text + footer
+    msg = text + footer
     if bot and CHAT_ID:
         try:
-            bot.send_message(CHAT_ID, payload)
-            time.sleep(1.2)
+            bot.send_message(CHAT_ID, msg)
+            time.sleep(1.5)
         except Exception as e:
-            if "429" in str(e):
-                import re
-                wait_sec = 15
-                try:
-                    m = re.search(r"retry after (\d+)", str(e))
-                    if m:
-                        wait_sec = int(m.group(1))
-                except Exception:
-                    pass
-                logging.warning("Telegram rate limited — waiting %ds", wait_sec)
-                time.sleep(wait_sec)
-            else:
-                logging.warning("Telegram send error: %s", e)
-                time.sleep(2)
+            logging.warning(f"Telegram send error: {e}")
+            time.sleep(2)
     else:
-        logging.info("TG(DISABLED) MSG: %s", payload.replace("\n", " | "))
+        logging.info("TG(DISABLED): %s", msg)
 
-# ========== EXCHANGE ==========
+# =================== EXCHANGE ===================
 def init_exchange():
     try:
         ex = ccxt.mexc({
             "apiKey": MEXC_API_KEY,
             "secret": MEXC_API_SECRET,
             "enableRateLimit": True,
-            "options": {"defaultType": "future", "adjustForTimeDifference": False}
+            "options": {"defaultType": "future"}
         })
         ex.load_markets(True)
         logging.info("Connected to MEXC Futures API (read-only).")
         send_telegram_text("✅ Connected to MEXC Futures API (read-only). Monitoring markets.")
         return ex
     except Exception as e:
-        logging.exception("Failed to init exchange: %s", e)
+        logging.exception(f"Exchange init failed: {e}")
         return None
 
-# ========== HELPERS ==========
+# =================== HELPERS ===================
 def ema(series, period):
     s = np.asarray(series, dtype=float)
     if len(s) < period: return np.array([])
@@ -105,12 +78,23 @@ def rsi(series, period=14):
     s = np.asarray(series, dtype=float)
     if len(s) < period + 1: return np.array([])
     d = np.diff(s)
-    g = np.where(d > 0, d, 0.0)
-    l = np.where(d < 0, -d, 0.0)
+    g = np.where(d > 0, d, 0)
+    l = np.where(d < 0, -d, 0)
     ag = np.convolve(g, np.ones(period)/period, mode='valid')
     al = np.convolve(l, np.ones(period)/period, mode='valid')
     rs = ag / (al + 1e-12)
-    return 100.0 - (100.0 / (1.0 + rs))
+    return 100 - (100 / (1 + rs))
+
+def fetch_ohlcv_safe(ex, symbol, timeframe, limit=200):
+    try:
+        data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        arr = np.array(data)
+        if len(arr) == 0:
+            return None, None, None, None, None
+        return arr[:,1], arr[:,2], arr[:,3], arr[:,4], arr[:,5]
+    except Exception as e:
+        logging.debug(f"Fetch error {symbol} {timeframe}: {e}")
+        return None, None, None, None, None
 
 def rr_ratio(entry, sl, tp):
     try:
@@ -120,137 +104,91 @@ def rr_ratio(entry, sl, tp):
     except Exception:
         return "N/A"
 
-def is_bullish(o, c, l): return (c - o > 0) and (o - l >= abs(c - o) * 1.2)
-def is_bearish(o, c, h): return (o - c > 0) and (h - o >= abs(o - c) * 1.2)
-
-# ========== SIGNAL LOG ==========
-def append_signal(rec):
-    if not os.path.exists(SIGNALS_LOG_FILE):
-        with open(SIGNALS_LOG_FILE, "w") as f: json.dump([], f)
-    try:
-        with open(SIGNALS_LOG_FILE, "r+", encoding="utf-8") as f:
-            arr = json.load(f)
-            arr.append(rec)
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
-            arr = [r for r in arr if datetime.fromisoformat(r["time"]).replace(tzinfo=timezone.utc) >= cutoff]
-            f.seek(0)
-            f.truncate()
-            json.dump(arr, f, indent=2)
-    except Exception as e:
-        logging.warning("Append log failed: %s", e)
-
-# ========== STRATEGY ==========
+# =================== SIGNAL ANALYSIS ===================
 def evaluate_symbol(ex, sym):
-    try:
-        o4, h4, l4, c4, v4 = np.array(ex.fetch_ohlcv(sym, "4h")[-200:]).T
-        o1, h1, l1, c1, v1 = np.array(ex.fetch_ohlcv(sym, "1h")[-200:]).T
-        o30, h30, l30, c30, v30 = np.array(ex.fetch_ohlcv(sym, "30m")[-200:]).T
-        o15, h15, l15, c15, v15 = np.array(ex.fetch_ohlcv(sym, "15m")[-200:]).T
-    except Exception:
+    o4,h4,l4,c4,v4 = fetch_ohlcv_safe(ex, sym, "4h")
+    o1,h1,l1,c1,v1 = fetch_ohlcv_safe(ex, sym, "1h")
+    o30,h30,l30,c30,v30 = fetch_ohlcv_safe(ex, sym, "30m")
+    o15,h15,l15,c15,v15 = fetch_ohlcv_safe(ex, sym, "15m")
+
+    if c4 is None or c1 is None or c30 is None or c15 is None:
         return None
 
     e20_4, e50_4 = ema(c4, 20), ema(c4, 50)
     e20_1, e50_1 = ema(c1, 20), ema(c1, 50)
     if len(e20_4) < 1 or len(e50_4) < 1: return None
+
     d4 = "bull" if e20_4[-1] > e50_4[-1] else "bear"
     d1 = "bull" if e20_1[-1] > e50_1[-1] else "bear"
     if d4 != d1: return None
 
-    rb, rs = is_bullish(o30[-1], c30[-1], l30[-1]), is_bearish(o30[-1], c30[-1], h30[-1])
-    e20_15, e50_15, rsi15 = ema(c15, 20), ema(c15, 50), rsi(c15, 14)
+    e20_15, e50_15, rsi15 = ema(c15, 20), ema(c15, 50), rsi(c15)
     if len(e20_15) < 3: return None
-    e20n, e50n, rsi_now = float(e20_15[-1]), float(e50_15[-1]), float(rsi15[-1])
-    cross_long = (e20_15[-2] <= e50_15[-2]) and (e20n > e50n)
-    cross_short = (e20_15[-2] >= e50_15[-2]) and (e20n < e50n)
-
+    cross_long = (e20_15[-2] <= e50_15[-2]) and (e20_15[-1] > e50_15[-1])
+    cross_short = (e20_15[-2] >= e50_15[-2]) and (e20_15[-1] < e50_15[-1])
+    rsi_now = float(rsi15[-1]) if len(rsi15) > 0 else 50
     entry = float(c15[-1])
-    if d4 == "bull" and rb and cross_long and rsi_now > 50:
-        side, sl, sig = "LONG", float(l30[-1]), "confirmed"
-    elif d4 == "bear" and rs and cross_short and rsi_now >= 70:
-        side, sl, sig = "SHORT", float(h30[-1]), "confirmed"
+
+    if d4 == "bull" and cross_long and rsi_now > 50:
+        side, sl, tp1, tp2 = "LONG", float(l30[-1]), entry + (entry - l30[-1])*3, entry + (entry - l30[-1])*6
+    elif d4 == "bear" and cross_short and rsi_now < 50:
+        side, sl, tp1, tp2 = "SHORT", float(h30[-1]), entry - (h30[-1]-entry)*3, entry - (h30[-1]-entry)*6
     else:
         return None
 
-    dist = abs(entry - sl)
-    tp1 = entry + dist * 3 if side == "LONG" else entry - dist * 3
-    tp2 = entry + dist * 6 if side == "LONG" else entry - dist * 6
-    return {"symbol": sym, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "signal_type": sig}
-
-def build_signal(out):
-    sym = out["symbol"].replace("/USDT", "/USDT.P")
-    typ = out["signal_type"].upper()
-    side = out["side"]
-    emoji = "📈" if side == "LONG" else "📉"
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [
-        f"✅ {typ} — {side} {emoji}",
-        f"PAIR: {sym}",
-        f"TIME: {now}",
-        "",
-        f"ENTRY: {out['entry']}",
-        f"SL: {out['sl']}",
-        f"TP1: {out['tp1']}",
-        f"TP2: {out['tp2']}",
-        "",
-        f"LEVERAGE: {DEFAULT_LEVERAGE}x (Isolated)",
-        f"RISK: ${RISK_USD}",
-    ]
-    return "\n".join(lines)
+    return {"symbol": sym, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2}
 
 def log_and_send(out):
-    rec = {
-        "symbol": out["symbol"],
-        "side": out["side"],
-        "entry": out["entry"],
-        "sl": out["sl"],
-        "tp1": out["tp1"],
-        "tp2": out["tp2"],
-        "signal_type": out.get("signal_type"),
-        "time": datetime.now(timezone.utc).isoformat()
-    }
-    append_signal(rec)
-    send_telegram_text(build_signal(out))
+    sym = out["symbol"].replace("/USDT", "/USDT.P")
+    msg = (
+        f"📈 SIGNAL DETECTED\n\n"
+        f"PAIR: {sym}\nSIDE: {out['side']}\n\n"
+        f"ENTRY: {out['entry']}\nSL: {out['sl']}\nTP1: {out['tp1']}\nTP2: {out['tp2']}\n\n"
+        f"LEVERAGE: {DEFAULT_LEVERAGE}x\nRISK: ${RISK_USD}\nTIME: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    send_telegram_text(msg)
+    rec = {"symbol": sym, "side": out["side"], "entry": out["entry"], "sl": out["sl"], "tp1": out["tp1"],
+           "tp2": out["tp2"], "time": datetime.now(timezone.utc).isoformat()}
+    with open(SIGNALS_LOG_FILE, "a") as f:
+        json.dump(rec, f)
+        f.write("\n")
 
-# ========== SUMMARY ==========
+# =================== SUMMARY + HEARTBEAT ===================
 def next_scheduled_run(now):
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    times = [today + timedelta(hours=h) for h in SUMMARY_HOURS_UTC]
-    times += [today + timedelta(days=1, hours=h) for h in SUMMARY_HOURS_UTC]
-    for t in sorted(times):
-        if t > now: return t
+    for h in SUMMARY_HOURS_UTC + [x + 24 for x in SUMMARY_HOURS_UTC]:
+        t = today + timedelta(hours=h)
+        if t > now:
+            return t
     return now + timedelta(hours=6)
 
-def summary_worker(ex):
+def summary_worker():
     while True:
         now = datetime.now(timezone.utc)
         nxt = next_scheduled_run(now)
         wait = (nxt - now).total_seconds()
-        logging.info("Summary worker: next run at %s (in %ds)", nxt, int(wait))
-        time.sleep(wait + 2)
-        send_telegram_text(f"📈 6H Summary Check — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\nNo summary data found or no trades this window.")
+        logging.info(f"Summary worker: next run at {nxt} (in {int(wait)}s)")
+        time.sleep(wait)
+        send_telegram_text(f"📊 Summary check — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\nNo new data this window.")
         time.sleep(2)
 
-# ========== HEARTBEAT ==========
 def heartbeat_worker(next_summary_time):
     while True:
-        now = datetime.now(timezone.utc)
         msg = f"[Heartbeat] Bot alive — next summary at {next_summary_time.strftime('%H:%M')} UTC"
         logging.info(msg)
         send_telegram_text(msg)
         time.sleep(HEARTBEAT_INTERVAL)
 
-# ========== MAIN ==========
+# =================== MAIN LOOP ===================
 def main_loop():
     ex = init_exchange()
-    if not ex:
-        return
-    markets = ex.load_markets()
-    syms = [s for s in markets if s.endswith(":USDT") or s.endswith("/USDT")][:MAX_SYMBOLS]
-    logging.info("Monitoring %d symbols. Risk per trade: $%s", len(syms), RISK_USD)
+    if not ex: return
+    syms = [s for s in ex.load_markets() if s.endswith(":USDT") or s.endswith("/USDT")][:MAX_SYMBOLS]
+    logging.info(f"Monitoring {len(syms)} symbols. Risk per trade: ${RISK_USD}")
     send_telegram_text(f"🚀 WSS Analytical running — monitoring {len(syms)} symbols. Risk ${RISK_USD}")
 
     nxt_summary = next_scheduled_run(datetime.now(timezone.utc))
-    threading.Thread(target=summary_worker, args=(ex,), daemon=True).start()
+    threading.Thread(target=summary_worker, daemon=True).start()
     threading.Thread(target=heartbeat_worker, args=(nxt_summary,), daemon=True).start()
 
     while True:
@@ -261,27 +199,22 @@ def main_loop():
                 log_and_send(out)
                 cnt += 1
                 time.sleep(0.3)
-        logging.info("Cycle done — Sent %d signals", cnt)
+        logging.info(f"Cycle done — Sent {cnt} signals")
         time.sleep(INTERVAL_SECONDS)
 
-# ========== FLASK ==========
+# =================== FLASK SERVER ===================
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return jsonify({"service": "WSS", "status": "running", "time": datetime.now(timezone.utc).isoformat()})
-def run_flask():
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
 
-# ========== START ==========
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
+# =================== START ===================
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    threading.Thread(target=run_flask, daemon=True).start()
     time.sleep(5)
     send_telegram_text("✅ WSS Analytical Bot restarted and fully live. Starting main analysis loop...")
     try:
-        main_loop()
-    except KeyboardInterrupt:
-        logging.info("Stopped manually.")
-    except Exception as e:
-        logging.exception("Main crash: %s", e)
