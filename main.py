@@ -1,68 +1,83 @@
 #!/usr/bin/env python3
 # ============================================================
-#   WSS v7.2 — ICT/SMC + OB/FVG + Reversal Candles + RSI Divergence
-#   + 6H Report Archiver + Daily Master Report
+# WSS v7.3 — Full analytical engine (ICT/SMC + OB/FVG + Reversal + Divergence)
+#  - 6H summaries, daily master report, archiving, telegram alerts
+#  - Designed for MEXC Futures USDT.P symbols
 # ============================================================
 
-import os, time, json, logging, threading, requests
+# -------------------------
+# Imports & basic setup
+# -------------------------
+import os
+import time
+import json
+import logging
+import threading
+import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify
+
 import numpy as np
 import ccxt
 import telebot
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# -------------------------
+# Configuration (env-first)
+# -------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
+
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
 
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "50"))
-INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "900"))  # 15 minutes
+INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "900"))  # 15 min cycles
 SUMMARY_HOURS_UTC = [0, 6, 12, 18]
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
 RISK_USD = float(os.getenv("RISK_USD", "10"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "200"))
+
 SIGNALS_LOG_FILE = os.getenv("SIGNALS_LOG_FILE", "signals_log.json")
-SIGNALS_RETENTION_HOURS = int(os.getenv("SIGNALS_RETENTION_HOURS", "48"))
+SIGNALS_RETENTION_HOURS = int(os.getenv("SIGNALS_RETENTION_HOURS", "72"))
 SILENCE_ALERT_HOURS = int(os.getenv("SILENCE_ALERT_HOURS", "3"))
 
-EMA_NEAR_RATIO = float(os.getenv("EMA_NEAR_RATIO", "0.002"))   # 0.2%
+EMA_NEAR_RATIO = float(os.getenv("EMA_NEAR_RATIO", "0.002"))   # 0.2% diff considered "near"
 RSI_NEAR_DELTA = float(os.getenv("RSI_NEAR_DELTA", "2.0"))
-MIN_SL_ENTRY_DIFF_RATIO = float(os.getenv("MIN_SL_ENTRY_DIFF_RATIO", "0.001"))  # 0.1%
 
-# ICT / SMC parameters
 OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", "20"))
 OB_BODY_RATIO = float(os.getenv("OB_BODY_RATIO", "0.6"))
 FVG_LOOKBACK = int(os.getenv("FVG_LOOKBACK", "12"))
 FVG_MIN_GAP = float(os.getenv("FVG_MIN_GAP", "0.0001"))
 
-# ============================================================
-# LOGGING & TELEGRAM
-# ============================================================
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logging.getLogger("ccxt").setLevel(logging.WARNING)
+
+# Telegram bot
 bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
 def send_telegram_text(text):
+    """Send text to TG (safe wrapper). Appends static footer warning."""
     footer = "\n\n⚠️ هذا تحليل فقط — لا أوامر تلقائية. تأكد من السيولة، الانزلاق، والعمولات قبل التنفيذ."
     msg = text + footer
     if bot and CHAT_ID:
         try:
             bot.send_message(CHAT_ID, msg)
-            time.sleep(1.0)
+            time.sleep(0.6)
         except Exception as e:
-            logging.warning("Telegram send error: %s", e)
-            time.sleep(2)
+            logging.warning("TG send error: %s", e)
     else:
+        # in debug mode print to logs so we can still see outputs
         logging.info("TG(DISABLED): %s", msg.replace("\n", " | "))
 
-# ============================================================
-# DATA FETCH HELPERS
-# ============================================================
+# -------------------------
+# Data fetch helpers
+# -------------------------
 def fetch_ohlcv_safe(ex, symbol, timeframe, limit=200, since=None):
+    """
+    Returns arrays: open, high, low, close, volume (numpy arrays) or (None,...)
+    Compatible with ccxt fetch_ohlcv returns.
+    """
     try:
         if since:
             data = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
@@ -71,6 +86,7 @@ def fetch_ohlcv_safe(ex, symbol, timeframe, limit=200, since=None):
         arr = np.array(data)
         if arr.size == 0:
             return None, None, None, None, None
+        # ccxt: [timestamp, open, high, low, close, volume]
         return arr[:,1].astype(float), arr[:,2].astype(float), arr[:,3].astype(float), arr[:,4].astype(float), arr[:,5].astype(float)
     except Exception as e:
         logging.debug("fetch_ohlcv_safe %s %s -> %s", symbol, timeframe, e)
@@ -79,104 +95,131 @@ def fetch_ohlcv_safe(ex, symbol, timeframe, limit=200, since=None):
 def fetch_ticker_safe(ex, symbol):
     try:
         t = ex.fetch_ticker(symbol)
-        return float(t.get("last") or t.get("close") or 0.0)
+        last = t.get("last") or t.get("close") or t.get("info",{}).get("lastPrice")
+        return float(last) if last is not None else None
     except Exception as e:
         logging.debug("fetch_ticker_safe %s -> %s", symbol, e)
         return None
 
-# ============================================================
-# INDICATORS
-# ============================================================
+# -------------------------
+# Indicators (numpy)
+# -------------------------
 def ema(series, period):
     s = np.asarray(series, dtype=float)
     if len(s) < period:
         return np.array([])
-    w = np.exp(np.linspace(-1., 0., period))
-    w /= w.sum()
-    return np.convolve(s, w, mode='full')[:len(s)]
+    alpha = 2.0 / (period + 1.0)
+    out = np.empty_like(s)
+    out[0] = s[0]
+    for i in range(1, len(s)):
+        out[i] = alpha * s[i] + (1 - alpha) * out[i-1]
+    return out
 
 def rsi(series, period=14):
     s = np.asarray(series, dtype=float)
     if len(s) < period + 1:
         return np.array([])
     d = np.diff(s)
-    g = np.where(d > 0, d, 0)
-    l = np.where(d < 0, -d, 0)
-    ag = np.convolve(g, np.ones(period)/period, mode='valid')
-    al = np.convolve(l, np.ones(period)/period, mode='valid')
-    rs = ag / (al + 1e-12)
+    up = np.where(d > 0, d, 0.0)
+    down = np.where(d < 0, -d, 0.0)
+    up_ewm = np.convolve(up, np.ones(period)/period, mode='valid')
+    down_ewm = np.convolve(down, np.ones(period)/period, mode='valid')
+    rs = up_ewm / (down_ewm + 1e-12)
     return 100.0 - (100.0 / (1.0 + rs))
 
-# ============================================================
-# ICT / SMC DETECTION
-# ============================================================
+# -------------------------
+# ICT / SMC style helpers (OB / FVG detection)
+# -------------------------
 def detect_order_blocks_from_ohlcv(open_a, high_a, low_a, close_a, lookback=OB_LOOKBACK, body_ratio=OB_BODY_RATIO):
     bullish_OBs, bearish_OBs = [], []
-    n = len(close_a)
-    if n < 3:
-        return bullish_OBs, bearish_OBs
-    start = max(2, n - lookback)
-    for i in range(start, n-1):
-        o, h, l, c = float(open_a[i]), float(high_a[i]), float(low_a[i]), float(close_a[i])
-        rng = h - l if (h - l) != 0 else 1e-9
-        body = abs(c - o)
-        body_ratio_val = body / rng
-        next_c = float(close_a[i+1])
-        if (c < o) and (body_ratio_val >= body_ratio) and (next_c > c):
-            ob_low = min(c, o); ob_high = max(c, o)
-            bullish_OBs.append({"low": ob_low, "high": ob_high, "idx": i})
-        if (c > o) and (body_ratio_val >= body_ratio) and (next_c < c):
-            ob_low = min(c, o); ob_high = max(c, o)
-            bearish_OBs.append({"low": ob_low, "high": ob_high, "idx": i})
+    try:
+        n = len(close_a)
+        if n < 3:
+            return bullish_OBs, bearish_OBs
+        start = max(2, n - lookback)
+        for i in range(start, n-1):
+            o, h, l, c = float(open_a[i]), float(high_a[i]), float(low_a[i]), float(close_a[i])
+            rng = h - l if (h - l) != 0 else 1e-9
+            body = abs(c - o)
+            br = body / rng
+            next_c = float(close_a[i+1])
+            # bullish OB: bearish candle followed by bullish continuation
+            if (c < o) and (br >= body_ratio) and (next_c > c):
+                bullish_OBs.append({"low": min(c,o), "high": max(c,o), "idx": i})
+            # bearish OB: bullish candle followed by bearish continuation
+            if (c > o) and (br >= body_ratio) and (next_c < c):
+                bearish_OBs.append({"low": min(c,o), "high": max(c,o), "idx": i})
+    except Exception as e:
+        logging.debug("detect_order_blocks error: %s", e)
     return bullish_OBs, bearish_OBs
 
 def detect_fvg_from_ohlcv(high_arr, low_arr, lookback=FVG_LOOKBACK, min_gap_rel=FVG_MIN_GAP):
     fvg_list = []
-    n = len(high_arr)
-    start = max(2, n - lookback)
-    for i in range(start, n-1):
-        prev_high, prev_low = float(high_arr[i-1]), float(low_arr[i-1])
-        mid_high, mid_low = float(high_arr[i]), float(low_arr[i])
-        if prev_low - mid_high > abs(prev_low) * min_gap_rel:
-            fvg_list.append({"low": mid_high, "high": prev_low, "idx": i, "type": "bullish"})
-        if mid_low - prev_high > abs(prev_high) * min_gap_rel:
-            fvg_list.append({"low": prev_high, "high": mid_low, "idx": i, "type": "bearish"})
+    try:
+        n = len(high_arr)
+        start = max(2, n - lookback)
+        for i in range(start, n-1):
+            prev_high, prev_low = float(high_arr[i-1]), float(low_arr[i-1])
+            mid_high, mid_low = float(high_arr[i]), float(low_arr[i])
+            # bullish FVG: gap where previous low is above mid high
+            if prev_low - mid_high > abs(prev_low) * min_gap_rel:
+                fvg_list.append({"low": mid_high, "high": prev_low, "idx": i, "type":"bullish"})
+            # bearish FVG: gap where mid low is above previous high
+            if mid_low - prev_high > abs(prev_high) * min_gap_rel:
+                fvg_list.append({"low": prev_high, "high": mid_low, "idx": i, "type":"bearish"})
+    except Exception as e:
+        logging.debug("detect_fvg error: %s", e)
     return fvg_list
 
 def find_confirmation_in_ob_fvg(ex, symbol, entry_price, side):
+    """
+    Checks 1H and 30m for OB/FVG close to entry_price.
+    Returns dict {ob:bool, fvg:bool, details:...}
+    """
     try:
         sym_ccxt = symbol.replace("/USDT.P","/USDT") if symbol.endswith("/USDT.P") else symbol
         o1,h1,l1,c1,v1 = fetch_ohlcv_safe(ex, sym_ccxt, "1h", limit=OB_LOOKBACK+10)
         o30,h30,l30,c30,v30 = fetch_ohlcv_safe(ex, sym_ccxt, "30m", limit=OB_LOOKBACK+10)
-        ob_hit, fvg_hit, details = False, False, {"1h":{}, "30m":{}}
-        margin = 0.002
+        ob_hit, fvg_hit = False, False
+        details = {"1h":{}, "30m":{}}
+        margin = 0.002  # 0.2%
         if c1 is not None:
             bull_ob, bear_ob = detect_order_blocks_from_ohlcv(o1,h1,l1,c1,lookback=OB_LOOKBACK)
-            fvg1 = detect_fvg_from_ohlcv(h1,l1, lookback=FVG_LOOKBACK)
+            fvg1 = detect_fvg_from_ohlcv(h1,l1,lookback=FVG_LOOKBACK)
             for ob in bull_ob + bear_ob:
-                if abs(entry_price - ((ob["low"]+ob["high"])/2)) / max(entry_price,1e-12) <= margin:
-                    ob_hit = True; details["1h"].setdefault("ob",[]).append(ob)
-            for fvg in fvg1:
-                if entry_price >= fvg["low"]*(1-margin) and entry_price <= fvg["high"]*(1+margin):
-                    fvg_hit = True; details["1h"].setdefault("fvg",[]).append(fvg)
+                mid = (ob["low"] + ob["high"]) / 2.0
+                if abs(entry_price - mid) / max(entry_price,1e-12) <= margin:
+                    ob_hit = True
+                    details["1h"].setdefault("ob",[]).append(ob)
+            for f in fvg1:
+                if entry_price >= f["low"]*(1-margin) and entry_price <= f["high"]*(1+margin):
+                    fvg_hit = True
+                    details["1h"].setdefault("fvg",[]).append(f)
         if c30 is not None:
             bull_ob2, bear_ob2 = detect_order_blocks_from_ohlcv(o30,h30,l30,c30,lookback=OB_LOOKBACK)
-            fvg2 = detect_fvg_from_ohlcv(h30,l30, lookback=FVG_LOOKBACK)
+            fvg2 = detect_fvg_from_ohlcv(h30,l30,lookback=FVG_LOOKBACK)
             for ob in bull_ob2 + bear_ob2:
-                if abs(entry_price - ((ob["low"]+ob["high"])/2)) / max(entry_price,1e-12) <= margin:
-                    ob_hit = True; details["30m"].setdefault("ob",[]).append(ob)
-            for fvg in fvg2:
-                if entry_price >= fvg["low"]*(1-margin) and entry_price <= fvg["high"]*(1+margin):
-                    fvg_hit = True; details["30m"].setdefault("fvg",[]).append(fvg)
+                mid = (ob["low"] + ob["high"]) / 2.0
+                if abs(entry_price - mid) / max(entry_price,1e-12) <= margin:
+                    ob_hit = True
+                    details["30m"].setdefault("ob",[]).append(ob)
+            for f in fvg2:
+                if entry_price >= f["low"]*(1-margin) and entry_price <= f["high"]*(1+margin):
+                    fvg_hit = True
+                    details["30m"].setdefault("fvg",[]).append(f)
         return {"ob": ob_hit, "fvg": fvg_hit, "details": details}
     except Exception as e:
         logging.debug("find_confirmation_in_ob_fvg error: %s", e)
         return {"ob": False, "fvg": False, "details": {}}
 
-# ============================================================
-# REVERSAL & DIVERGENCE DETECTION
-# ============================================================
+# -------------------------
+# Reversal candles & divergence
+# -------------------------
 def detect_reversal_candle(o,h,l,c):
+    """
+    Simple detection for doji, hammer, shooting star.
+    Returns string or None.
+    """
     try:
         o,h,l,c = float(o), float(h), float(l), float(c)
     except:
@@ -185,18 +228,38 @@ def detect_reversal_candle(o,h,l,c):
     rng = h - l if (h - l) != 0 else 1e-9
     upper = h - max(c, o)
     lower = min(c, o) - l
-    if body / rng < 0.2 and upper > body and lower > body: return "doji"
-    if body / rng > 0.6 and lower > body * 2 and c > o: return "hammer"
-    if body / rng > 0.6 and upper > body * 2 and c < o: return "shooting_star"
+    # Doji-like: tiny body and long wicks both sides
+    if body / rng < 0.2 and upper > body and lower > body:
+        return "doji"
+    # Hammer: small body near top with long lower wick and bullish close
+    if body / rng > 0.6 and lower > body * 2 and c > o:
+        return "hammer"
+    # Shooting star: small body near bottom with long upper wick and bearish close
+    if body / rng > 0.6 and upper > body * 2 and c < o:
+        return "shooting_star"
     return None
 
 def detect_rsi_divergence(closes, rsis):
-    if len(closes) < 5 or len(rsis) < 5: return None
-    recent = np.array(closes[-5:], dtype=float)
-    r_recent = np.array(rsis[-5:], dtype=float)
-    if recent[-1] < recent[-2] and r_recent[-1] > r_recent[-2]: return "bullish"
-    if recent[-1] > recent[-2] and r_recent[-1] < r_recent[-2]: return "bearish"
+    """
+    Very simple short-window divergence check:
+    compare last two swings in closes and rsi arrays.
+    """
+    try:
+        if len(closes) < 5 or len(rsis) < 5:
+            return None
+        recent = np.array(closes[-5:], dtype=float)
+        r_recent = np.array(rsis[-5:], dtype=float)
+        # Basic slope sign change: price making lower low while RSI makes higher low -> bullish divergence
+        if recent[-1] < recent[-2] and r_recent[-1] > r_recent[-2]:
+            return "bullish"
+        if recent[-1] > recent[-2] and r_recent[-1] < r_recent[-2]:
+            return "bearish"
+    except Exception as e:
+        logging.debug("detect_rsi_divergence error: %s", e)
     return None
+# ============================================================
+# PART 2 — Evaluation, Signal storage, Position sizing, Sending
+# ============================================================
 
 def evaluate_symbol(ex, sym):
     """
@@ -451,36 +514,20 @@ def check_signal_status(record):
         return {"status":"unknown","hit_time":None,"hit_price":None}
 
 # ----------------------------
-# ---------- SUMMARY WORKER ----------
-def summary_worker():
-    """
-    Runs the 6-hour summary report automatically.
-    Sleeps until the next UTC checkpoint (00:00, 06:00, 12:00, 18:00),
-    then generates and sends the report to Telegram and saves JSON locally.
-    """
-    while True:
-        try:
-            now_utc = datetime.now(timezone.utc)
-            # نقاط التشغيل: 00:00 / 06:00 / 12:00 / 18:00 UTC
-            hours = [0, 6, 12, 18]
-            nxt_hour = min([h for h in hours if h > now_utc.hour] or [hours[0]])
-            nxt_day = now_utc if nxt_hour > now_utc.hour else now_utc + timedelta(days=1)
-            nxt_run = nxt_day.replace(hour=nxt_hour, minute=0, second=5, microsecond=0)
-
-            wait_sec = (nxt_run - now_utc).total_seconds()
-            logging.info("Summary worker sleeping until %s UTC (%.0f seconds)", nxt_run.strftime("%Y-%m-%d %H:%M"), wait_sec)
-            time.sleep(max(60, wait_sec))  # ماينفعش ينتظر أقل من دقيقة
-
-            # تنفيذ التقرير
-            build_and_send_6h_summary()
-            logging.info("6-hour summary successfully executed at %s UTC", nxt_run.strftime("%Y-%m-%d %H:%M"))
-
-            # ننام 5 دقائق احتياط بعد التنفيذ
-            time.sleep(300)
-        except Exception as e:
-            logging.exception("summary_worker error: %s", e)
-            time.sleep(300)
-
+# SUMMARY WORKER (6H) with local archiver
+# ----------------------------
+def next_scheduled_run(now_utc):
+    today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    candidates = []
+    for d in [0,1]:
+        base = today + timedelta(days=d)
+        for h in SUMMARY_HOURS_UTC:
+            candidates.append(base + timedelta(hours=h))
+    candidates = sorted(candidates)
+    for c in candidates:
+        if c > now_utc:
+            return c
+    return now_utc + timedelta(hours=6)
 
 def build_and_send_6h_summary():
     now = datetime.now(timezone.utc)
@@ -543,9 +590,35 @@ def build_and_send_6h_summary():
     except Exception as e:
         logging.warning("Failed to save summary report: %s", e)
 
+# ------------------------------------------------------------
+# Finish Part 2 here. Next message will contain Part 3 (workers, main loop, flask keepalive, startup)
+# ------------------------------------------------------------
 # ============================================================
 # PART 3 — Workers, Main loop, Flask keepalive, Startup
 # ============================================================
+
+# ---------- SUMMARY WORKER ----------
+def summary_worker():
+    """
+    Runs the 6-hour summary report automatically.
+    Sleeps until the next UTC checkpoint (00:00, 06:00, 12:00, 18:00),
+    then generates and sends the report to Telegram and saves JSON locally.
+    """
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            nxt = next_scheduled_run(now_utc)
+            wait_sec = (nxt - now_utc).total_seconds()
+            logging.info("Summary worker sleeping until %s UTC (%.0f s)", nxt.strftime("%Y-%m-%d %H:%M"), wait_sec)
+            # guard against tiny waits
+            time.sleep(max(30, wait_sec))
+            build_and_send_6h_summary()
+            logging.info("6-hour summary executed at %s UTC", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+            # small cool-down
+            time.sleep(5)
+        except Exception as e:
+            logging.exception("summary_worker error: %s", e)
+            time.sleep(300)
 
 # ---------- DAILY REPORT WORKER ----------
 def build_and_send_daily_report():
@@ -558,7 +631,7 @@ def build_and_send_daily_report():
 
         report_files = [f for f in os.listdir("reports") if f.startswith("report_")]
         daily_entries = []
-        counts = {"tp2":0, "tp1":0, "sl":0, "open":0}
+        counts = {"tp2":0, "tp1":0, "sl":0, "open":0, "unknown":0}
         for rf in report_files:
             fp = os.path.join("reports", rf)
             try:
@@ -621,13 +694,14 @@ def daily_report_worker():
     while True:
         try:
             now = datetime.now(timezone.utc)
-            # run at midnight UTC
+            # next midnight UTC + small buffer
             next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
             wait = (next_midnight - now).total_seconds()
             logging.info("Daily report worker sleeping until midnight UTC (%.0fs)", wait)
-            time.sleep(wait + 1)
+            time.sleep(max(60, wait))
             build_and_send_daily_report()
-            time.sleep(60)
+            # small delay after sending
+            time.sleep(10)
         except Exception as e:
             logging.exception("daily_report_worker error: %s", e)
             time.sleep(60)
@@ -703,7 +777,6 @@ def main_loop():
     threading.Thread(target=heartbeat_worker, daemon=True).start()
     threading.Thread(target=silence_monitor, daemon=True).start()
     threading.Thread(target=daily_report_worker, daemon=True).start()
-    # summary_worker defined earlier in Part 2
 
     cycle_index = 0
     while True:
@@ -717,6 +790,8 @@ def main_loop():
             scanned += 1
             try:
                 out = evaluate_symbol(ex, s)
+                if not out:
+                    continue
                 status = out.get("status")
                 if status == "confirmed":
                     ok = send_and_store(out, kind="CONFIRMED")
@@ -747,7 +822,7 @@ def main_loop():
         logging.info(summary_msg)
         send_telegram_text(summary_msg)
 
-        # preview messages
+        # preview messages (short)
         preview_lines = []
         for c in confirmed_list[:6]:
             preview_lines.append(f"✅ {c['symbol'].replace('/USDT','/USDT.P')} {c['side']} ENTRY:{round(c['entry'],8)}")
@@ -788,8 +863,8 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
         threading.Thread(target=render_ping, daemon=True).start()
         time.sleep(3)
-        send_telegram_text("✅ WSS Analytical Bot (v7.2) restarted and fully live. Starting main analysis loop...")
-        # initial 6H summary on startup
+        send_telegram_text("✅ WSS Analytical Bot (v7.3) restarted and fully live. Starting main analysis loop...")
+        # initial 6H summary on startup (safe-guard)
         try:
             build_and_send_6h_summary()
             logging.info("Initial 6H summary executed successfully at startup.")
@@ -800,4 +875,3 @@ if __name__ == "__main__":
         main_loop()
     except Exception as e:
         logging.exception("Fatal startup error: %s", e)
-
