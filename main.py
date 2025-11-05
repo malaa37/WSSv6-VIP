@@ -771,6 +771,8 @@ def main_loop():
 
     logging.info("Monitoring %d symbols. Risk per trade: $%s", len(symbols), RISK_USD)
     send_telegram_text(f"🚀 WSS Analytical running — monitoring {len(symbols)} symbols. Risk ${RISK_USD}")
+    send_telegram_text("🧠 Warm-up: Running initial deep analysis for first cycle...")
+     time.sleep(5)
 
     # start background workers
     threading.Thread(target=summary_worker, daemon=True).start()
@@ -875,3 +877,4 @@ if __name__ == "__main__":
         main_loop()
     except Exception as e:
         logging.exception("Fatal startup error: %s", e)
+
