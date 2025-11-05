@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# WSS v7.0 — ICT/SMC + OB/FVG + Reversal Candles + RSI Divergence Edition
+# WSS v7.1 — ICT/SMC + OB/FVG + Reversal Candles + RSI Divergence + 6H Report Archiver
 # All-in-one main.py
 # Put TELEGRAM_TOKEN, CHAT_ID, MEXC_API_KEY, MEXC_API_SECRET in environment variables.
 
@@ -57,7 +57,6 @@ def send_telegram_text(text):
             time.sleep(1.0)
         except Exception as e:
             logging.warning("TG send error: %s", e)
-            # basic backoff
             time.sleep(2)
     else:
         logging.info("TG(DISABLED) MSG: %s", msg.replace("\n"," | "))
@@ -202,7 +201,6 @@ def detect_reversal_candle(o,h,l,c):
     # shooting star bearish
     if body / rng > 0.6 and upper > body * 2 and c < o:
         return "shooting_star"
-    # engulfing detection simple (current vs previous not handled here)
     return None
 
 def detect_rsi_divergence(closes, rsis):
@@ -402,7 +400,7 @@ def send_and_store(out, kind):
     txt = format_trade_text(out, kind=("CONFIRMED" if kind=="CONFIRMED" else ("NEAR" if kind=="NEAR" else "PRE")))
     send_telegram_text(txt)
     if kind in ("CONFIRMED","NEAR"):
-        rec = {"symbol": out["symbol"], "side": out["side"], "entry": out["entry"], "sl": out["sl"], "tp1": out["tp1"], "tp2": out["tp2"], "time": datetime.now(timezone.utc).isoformat(), "kind": kind}
+        rec = {"symbol": out["symbol"], "side": out["side"], "entry": out["entry"], "sl": out["sl"], "tp1": out["tp1"], "tp2": out["tp2"], "time": datetime.now(timezone.utc).isoformat(), "kind": kind, "note": out.get("note","")}
         append_signal_log(rec)
     return True
 
@@ -454,7 +452,7 @@ def check_signal_status(record):
         logging.exception("check_signal_status error: %s", e)
         return {"status":"unknown","hit_time":None,"hit_price":None}
 
-# ========== SUMMARY WORKER (6H) ==========
+# ========== SUMMARY WORKER (6H) with archiver ==========
 def next_scheduled_run(now_utc):
     today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     candidates = []
@@ -476,6 +474,7 @@ def build_and_send_6h_summary():
     if not window:
         logging.info("Summary: no signals in the 6h window.")
         return
+
     report_entries = []
     counts = {"tp2":0,"tp1":0,"sl":0,"open":0,"unknown":0}
     for rec in window:
@@ -492,8 +491,11 @@ def build_and_send_6h_summary():
             "sl": rec["sl"],
             "tp1": rec["tp1"],
             "tp2": rec["tp2"],
-            "kind": rec.get("kind","?")
+            "kind": rec.get("kind","?"),
+            "note": rec.get("note","")
         })
+
+    # build text message
     header = f"📈 WSS 6H Report — {since.strftime('%Y-%m-%d %H:%M')} → {now.strftime('%Y-%m-%d %H:%M')} UTC\n"
     lines = [header]
     idx = 1
@@ -504,10 +506,31 @@ def build_and_send_6h_summary():
             lines.append(f"    Hit time: {e['hit_time']} | Price: {e.get('hit_price')}")
         else:
             lines.append(f"    Entry: {e['entry']} | SL: {e['sl']} | TP1: {e['tp1']} | TP2: {e['tp2']}")
+        if e.get("note"):
+            lines.append(f"    Note: {e['note']}")
         idx += 1
+
     lines.append("")
     lines.append(f"Summary counts — TP2: {counts.get('tp2',0)} | TP1: {counts.get('tp1',0)} | SL: {counts.get('sl',0)} | OPEN: {counts.get('open',0)}")
+
+    # send to telegram
     send_telegram_text("\n".join(lines))
+
+    # -------- NEW FEATURE: Save JSON report locally --------
+    try:
+        os.makedirs("reports", exist_ok=True)
+        filename = f"reports/report_{now.strftime('%Y-%m-%d_%HUTC')}.json"
+        report_data = {
+            "start": since.isoformat(),
+            "end": now.isoformat(),
+            "entries": report_entries,
+            "counts": counts
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved summary report to {filename}")
+    except Exception as e:
+        logging.warning(f"Failed to save summary report: {e}")
 
 def summary_worker():
     while True:
@@ -657,7 +680,7 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=render_ping, daemon=True).start()
     time.sleep(5)
-    send_telegram_text("✅ WSS Analytical Bot (v7.0) restarted and fully live. Starting main analysis loop...")
+    send_telegram_text("✅ WSS Analytical Bot (v7.1) restarted and fully live. Starting main analysis loop...")
     try:
         main_loop()
     except Exception as e:
