@@ -22,8 +22,8 @@ import requests
 # -------------------
 # CONFIG - edit these
 # -------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")   # set or leave empty
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # set or leave empty (channel id or chat id)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8260742606:AAH5wqWoA4df7LX_HyrYFVt6oSb-c8Ujtmw")   # set or leave empty
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@Signalsforlycans")  # set or leave empty (channel id or chat id)
 MEXC_API_KEY = os.getenv("MEXC_KEY", "")   # optional; not required for public OHLCV
 MEXC_API_SECRET = os.getenv("MEXC_SECRET", "")  # optional
 
@@ -515,3 +515,4 @@ if __name__ == "__main__":
         logger.info("Interrupted by user, exiting.")
     except Exception as e:
         logger.exception("Fatal error: %s", e)
+
