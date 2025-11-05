@@ -632,6 +632,43 @@ def main():
         time.sleep(to_sleep)
 
 # Entry
+import gzip
+import io
+import requests
+from datetime import datetime, timezone
+
+# دالة إرسال نسخة احتياطية فورية عند كتابة /backup في التليجرام
+def send_manual_backup(update=None):
+    try:
+        filename = f"signals_backup_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%HUTC')}.json.gz"
+        
+        # قراءة وضغط الملف
+        with open("signals_history.json", "rb") as f_in:
+            data = f_in.read()
+            buffer = io.BytesIO()
+            with gzip.GzipFile(filename, "wb", fileobj=buffer) as f_out:
+                f_out.write(data)
+            buffer.seek(0)
+
+        # إرسال الملف لتليجرام
+        files = {'document': (filename, buffer, 'application/gzip')}
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": f"📦 Manual backup sent — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"},
+            files=files
+        )
+
+        logging.info("✅ Manual backup sent successfully.")
+        if update:
+            send_telegram_text("✅ Manual backup sent successfully.")
+    except Exception as e:
+        logging.error(f"⚠️ Manual backup failed: {e}")
+        if update:
+            send_telegram_text(f"⚠️ Backup failed: {e}")
+
+# تسجيل أمر /backup للبوت
+def handle_command(command):
+    
 if __name__ == "__main__":
     try:
         main()
@@ -639,3 +676,4 @@ if __name__ == "__main__":
         logger.info("Interrupted by user.")
     except Exception as e:
         logger.exception("Fatal error: %s", e)
+
