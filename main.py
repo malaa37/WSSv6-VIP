@@ -546,4 +546,4 @@ def build_and_send_6h_report():
     if not window:
         logging.info("No signals in last 6h.")
         return
-    lines = [f"📈 WSS 6H Report — {since
+    lines = [f"WSS 6H Report - {since.strftime('%Y-%m-%d %H:%M')} to {now.strftime('%Y-%m-%d %H:%M')} UTC"]
