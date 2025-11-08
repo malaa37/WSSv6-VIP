@@ -1,6 +1,6 @@
-requests
+tradingview_ta
+telebot
 pandas
 numpy
-python-dateutil
-pyTelegramBotAPI
-ta
+python-dotenv
+requests
