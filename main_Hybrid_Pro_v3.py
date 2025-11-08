@@ -1,8 +1,12 @@
-# main_Hybrid_Pro_v3.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-WSS Hybrid Pro v3.0 — Part 1/3
-Hybrid strategy = Your conservative trend-filter + My ICT/SMC entry system
-(Part 1 contains imports, config, telegram helpers, exchange data wrappers, indicators, and pattern detectors)
+main_Hybrid_Pro_v5.py
+WSS Hybrid Analytical Bot v5 — combined strategy engine + robust comms.
+
+Usage:
+ - Set environment variables (see below)
+ - Run: python main_Hybrid_Pro_v5.py
 """
 
 import os
@@ -12,730 +16,674 @@ import math
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 import numpy as np
 import pandas as pd
-from dateutil import parser
 
-# Try to import optional libs
-try:
-    import telebot
-except Exception:
-    telebot = None
-
-# -----------------------------
-# Configuration (Environment)
-# -----------------------------
-# Put these env vars in Render/GitHub secrets
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-MEXC_REST = os.getenv("MEXC_REST", "https://contract.mexc.com")  # public futures base (adjust if needed)
-
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "60"))          # how many pairs to scan
-CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL", "900"))  # seconds (15m)
-RISK_USD = float(os.getenv("RISK_USD", "10.0"))
-CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "85.0"))  # CONFIRMED threshold %
-NEAR_THRESHOLD = float(os.getenv("NEAR_THRESHOLD", "70.0"))  # NEAR threshold %
-MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "3"))
-DATA_DIR = os.getenv("DATA_DIR", "wss_hybrid_data")
-REPORTS_DIR = os.path.join(DATA_DIR, "reports")
-SIGNALS_FILE = os.path.join(DATA_DIR, "signals_history.json")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-
-os.makedirs(REPORTS_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# -----------------------------
+# ----------------------------
 # Logging
-# -----------------------------
-logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-                    format="%(asctime)s %(levelname)s: %(message)s")
-logger = logging.getLogger("WSS_Hybrid_Pro")
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-# -----------------------------
-# Telegram helper
-# -----------------------------
-bot = None
-if telebot and TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "YOUR_TELEGRAM_BOT_TOKEN":
+# ----------------------------
+# Configuration - Environment Variables
+# ----------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "CHAT_ID_HERE")
+TELEGRAM_POLLING_ENABLED = os.getenv("TELEGRAM_POLLING_ENABLED", "false").lower() in ("1", "true", "yes")
+
+MEXC_BASE = os.getenv("MEXC_BASE", "https://contract.mexc.com")  # read-only endpoints used
+RISK_USD = float(os.getenv("RISK_USD", "10.0").replace("$", "").strip())
+MAX_PAIRS = int(os.getenv("MAX_PAIRS", "200"))
+MIN_CONF_PERCENT = int(os.getenv("MIN_CONF_PERCENT", "85"))
+CYCLE_INTERVAL_SEC = int(os.getenv("CYCLE_INTERVAL_SEC", str(15 * 60)))  # default 15 minutes
+SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "200"))  # how many pairs to consider (cap)
+
+# Files/folders
+REPORTS_DIR = "reports"
+DAILY_DIR = "daily_reports"
+HISTORY_FILE = "signals_history.json"
+
+# Make sure folders exist
+os.makedirs(REPORTS_DIR, exist_ok=True)
+os.makedirs(DAILY_DIR, exist_ok=True)
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def safe_request(url, method="get", params=None, jsondata=None, headers=None, timeout=10, retries=2, backoff=1.5):
+    for attempt in range(retries + 1):
+        try:
+            if method.lower() == "get":
+                r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            else:
+                r = requests.post(url, json=jsondata, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            logging.warning("HTTP request failed (%s): %s (attempt %d/%d)", url, e, attempt, retries)
+            if attempt == retries:
+                raise
+            time.sleep(backoff * (attempt + 1))
+    raise RuntimeError("unreachable")
+
+def now_iso():
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+def load_json_file(path: str, default):
     try:
-        bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=True)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        bot = None
+        return default
 
-def send_telegram_text(text: str):
-    """Send text to telegram if configured, else log."""
+def save_json_file(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ----------------------------
+# Telegram: send via HTTP method to avoid polling conflicts
+# ----------------------------
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+def send_telegram_text(text: str, parse_mode: str = "HTML"):
+    if TELEGRAM_BOT_TOKEN.startswith("BOT_TOKEN") or TELEGRAM_CHAT_ID.startswith("CHAT_ID"):
+        logging.info("TG disabled (placeholder tokens). Message would be:\n%s", text)
+        return True
     try:
-        if bot:
-            bot.send_message(TELEGRAM_CHAT_ID, text)
-        else:
-            logger.info("[TG] %s", text.replace("\n", " | "))
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode}
+        r = safe_request(f"{TELEGRAM_API_URL}/sendMessage", method="post", jsondata=payload, timeout=10, retries=2)
+        logging.info("Sent Telegram message (%s): %s", r.status_code, text.splitlines()[0] if text else "")
         return True
     except Exception as e:
-        logger.warning("Telegram send failed: %s", e)
+        logging.error("Failed to send telegram message: %s", e)
         return False
 
-# -----------------------------
-# Exchange / Data wrappers (MEXC)
-# -----------------------------
-def fetch_symbols_usdt_p(limit: int = MAX_SYMBOLS) -> List[str]:
-    """
-    Discover futures symbols (USDT.P). Uses MEXC public pairs endpoint.
-    Returns normalized symbols like 'BTC/USDT.P'.
-    """
-    try:
-        url = f"{MEXC_REST}/api/v1/contract/pairs"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        j = r.json()
-        items = j.get("data") or j.get("result") or []
-        syms = []
-        for it in items:
-            # MEXC pair key may be 'symbol' or 'symbolName'
-            s = it.get("symbol") or it.get("symbolName") or it.get("instId") or ""
-            if not s:
-                continue
-            # normalize various shapes
-            if s.endswith("USDT.P"):
-                form = s.replace("_", "/")
-                syms.append(form if "/" in form else s)
-            elif s.endswith("USDT"):
-                # convert to USDT.P presentation
-                if "_" in s:
-                    s2 = s.replace("_", "/") + ".P"
-                elif "/" in s:
-                    s2 = s + ".P"
-                else:
-                    s2 = s + "/USDT.P"
-                syms.append(s2)
-        # fallback if none
-        syms = list(dict.fromkeys(syms))
-        if not syms:
-            logger.warning("No symbols from API; using fallback sample")
-            syms = ["BTC/USDT.P", "ETH/USDT.P", "SOL/USDT.P"]
-        return syms[:limit]
-    except Exception as e:
-        logger.warning("fetch_symbols_usdt_p failed: %s", e)
-        # fallback small list
-        return ["BTC/USDT.P", "ETH/USDT.P", "SOL/USDT.P"][:limit]
-
-def fetch_ohlcv(symbol: str, timeframe: str = "15m", limit: int = 200) -> pd.DataFrame:
-    """
-    Fetch OHLCV from MEXC futures public kline endpoint.
-    symbol: expects format like "BTC_USDT" or similar depending on MEXC endpoint requirement.
-    timeframe: '1m','5m','15m','30m','1h','4h'
-    Returns DataFrame with columns: ['ts','open','high','low','close','volume'] (ts = datetime UTC index)
-    """
-    try:
-        # Normalize symbol for request: many MEXC endpoints use 'BTC_USDT' (no slash, no .P)
-        api_sym = symbol.replace("/", "_").replace(".P", "").replace(".", "_")
-        # map timeframe -> period param (MEXC expects e.g. '1m','15m','60m' etc)
-        period = timeframe
-        url = f"{MEXC_REST}/api/v1/contract/kline?symbol={api_sym}&period={period}&limit={limit}"
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        j = r.json()
-        data = j.get("data") or j.get("rows") or j.get("result") or []
-        if not data:
-            return pd.DataFrame()
-        # Data expected as list of [ts, open, high, low, close, volume]
-        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
-        # if ts in ms or unix, try convert
+# Optional polling (for simple commands like /marketCondition). We'll use polling only if explicitly enabled.
+update_offset = None
+def telegram_poll_loop():
+    global update_offset
+    if not TELEGRAM_POLLING_ENABLED:
+        logging.info("Telegram polling is disabled (TELEGRAM_POLLING_ENABLED=false)")
+        return
+    logging.info("Telegram polling started (be careful: enable only one instance)")
+    while True:
         try:
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            params = {"timeout": 20, "offset": update_offset}
+            r = safe_request(f"{TELEGRAM_API_URL}/getUpdates", params=params, timeout=25, retries=1)
+            j = r.json()
+            for upd in j.get("result", []):
+                update_offset = upd["update_id"] + 1
+                if "message" in upd:
+                    chat = upd["message"]["chat"]["id"]
+                    text = upd["message"].get("text", "")
+                    handle_telegram_command(chat, text)
+        except requests.exceptions.HTTPError as e:
+            if hasattr(e, "response") and e.response is not None and e.response.status_code == 409:
+                logging.error("Telegram polling conflict (409). Stopping polling to avoid conflict.")
+                break
+            logging.exception("Telegram polling error, continuing...")
+            time.sleep(5)
         except Exception:
-            df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-        df.set_index("ts", inplace=True)
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
+            logging.exception("Unexpected error in telegram_poll_loop")
+            time.sleep(5)
+
+def handle_telegram_command(chat_id, text):
+    # Basic commands: /marketCondition
+    txt = text.strip().lower()
+    if txt.startswith("/marketcondition"):
+        mc = market_condition_report()
+        send_telegram_text(mc)
+    elif txt.startswith("/status"):
+        send_telegram_text(f"✅ WSS Hybrid v5 — monitoring. {len(current_symbols)} USDT.P symbols.")
+    else:
+        # ignore unknown
+        logging.info("TG: unknown command from %s: %s", chat_id, text)
+
+# ----------------------------
+# MEXC API helpers (read-only)
+# ----------------------------
+def fetch_symbols_usdt_p(limit=200) -> List[str]:
+    """
+    Fetch futures contract symbols from MEXC and return filtered list of 'USDT.P' symbols.
+    Endpoint used: /open/api/v1/contract/config (public listing) OR /open/api/v1/contract/market/info
+    We'll try a stable public endpoint; fallback to static list if fails.
+    """
+    try:
+        url = f"{MEXC_BASE}/open/api/v1/contract/symbols"  # may vary; many MEXC contract apis exist
+        r = safe_request(url, timeout=8, retries=2)
+        data = r.json()
+        symbols = []
+        # try to parse different shapes
+        if isinstance(data, dict) and "data" in data:
+            for item in data["data"]:
+                sym = item.get("symbol") or item.get("symbolName") or item.get("contractCode")
+                if sym and sym.endswith("USDT.P"):
+                    symbols.append(sym)
+        # fallback: use items that contain 'USDT' and append .P
+        if not symbols:
+            # try another endpoint
+            url2 = f"{MEXC_BASE}/open/api/v2/market/symbols"
+            r2 = safe_request(url2, timeout=8, retries=1)
+            d2 = r2.json()
+            for item in d2.get("data", []):
+                s = item.get("symbol")
+                if s and "USDT" in s:
+                    if s.endswith(".P"):
+                        symbols.append(s)
+                    else:
+                        # normalize to USDT.P if possible
+                        if s.endswith("USDT"):
+                            symbols.append(s + ".P")
+        symbols = list(dict.fromkeys(symbols))[:limit]
+        logging.info("Discovered %d USDT.P symbols.", len(symbols))
+        return symbols
     except Exception as e:
-        logger.debug("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, e)
-        return pd.DataFrame()
+        logging.warning("fetch_symbols_usdt_p failed: %s - fallback to small list", e)
+        # fallback minimal list (so bot can run)
+        return ["BTC/USDT.P", "ETH/USDT.P", "BCH/USDT.P"]  # keep as example
 
-# -----------------------------
-# Indicators (efficient pandas)
-# -----------------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+def fetch_klines(symbol: str, interval: str = "15m", limit: int = 200) -> pd.DataFrame:
+    """
+    Fetch kline/candles for contract symbol from MEXC. We will try a few endpoints and shape into a DataFrame.
+    We expect symbol like 'BTC/USDT.P' or 'BTCUSDT.P' etc.
+    """
+    # normalize symbol for endpoint
+    sym = symbol.replace("/", "").replace(".P", "USDT.P") if "/" in symbol else symbol
+    sym = sym.replace("USDT.P", "USDT")  # many endpoints use BTCUSDT
+    # Try endpoint that returns candles
+    endpoints = [
+        f"{MEXC_BASE}/open/api/v2/market/kline",  # common shape: symbol, interval
+        f"{MEXC_BASE}/open/api/v1/contract/market/kline"
+    ]
+    params = {"symbol": sym, "interval": interval, "limit": limit}
+    for url in endpoints:
+        try:
+            r = safe_request(url, params=params, timeout=8, retries=2)
+            j = r.json()
+            # parse arrays
+            arr = j.get("data") or j.get("result") or j.get("ticks") or j.get("kline")
+            if not arr:
+                continue
+            # arr might be list of lists: [timestamp, open, high, low, close, volume]
+            rows = []
+            for item in arr[-limit:]:
+                if isinstance(item, list) and len(item) >= 6:
+                    ts = int(item[0]) // 1000 if item[0] > 1e12 else int(item[0])
+                    rows.append({
+                        "time": datetime.utcfromtimestamp(ts),
+                        "open": float(item[1]),
+                        "high": float(item[2]),
+                        "low": float(item[3]),
+                        "close": float(item[4]),
+                        "volume": float(item[5])
+                    })
+                elif isinstance(item, dict):
+                    ts = item.get("id") or item.get("timestamp") or item.get("time")
+                    if ts is None:
+                        continue
+                    ts = int(ts) // 1000 if int(ts) > 1e12 else int(ts)
+                    rows.append({
+                        "time": datetime.utcfromtimestamp(ts),
+                        "open": float(item.get("open", 0)),
+                        "high": float(item.get("high", 0)),
+                        "low": float(item.get("low", 0)),
+                        "close": float(item.get("close", 0)),
+                        "volume": float(item.get("volume", 0))
+                    })
+            if not rows:
+                continue
+            df = pd.DataFrame(rows).set_index("time")
+            return df
+        except Exception as e:
+            logging.debug("fetch_klines attempt failed for %s: %s", url, e)
+            continue
+    # If all fail, return empty DF
+    return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
-def sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window=window, min_periods=1).mean()
+# ----------------------------
+# Indicators & pattern detectors
+# ----------------------------
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(com=length-1, adjust=False).mean()
-    ma_down = down.ewm(com=length-1, adjust=False).mean()
+    ma_up = up.ewm(alpha=1/period, min_periods=period).mean()
+    ma_down = down.ewm(alpha=1/period, min_periods=period).mean()
     rs = ma_up / (ma_down + 1e-9)
     return 100 - (100 / (1 + rs))
 
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(length, min_periods=1).mean()
-
-# -----------------------------
-# Pattern detectors (reversal / OB / FVG / divergence)
-# -----------------------------
 def detect_reversal_candle(df: pd.DataFrame) -> Tuple[bool, str]:
     """
-    Returns (found, tag) for last candle in df.
-    tags: 'bull_engulf', 'bear_engulf', 'hammer', 'shooting_star', 'doji_reject'
+    Basic reversal detection: hammer/inverted-hammer, shooting-star, doji.
+    Returns (is_reversal, type_str)
     """
-    if df.shape[0] < 2:
+    if df.shape[0] < 3:
         return False, ""
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    body = abs(last['close'] - last['open'])
-    prev_body = abs(prev['close'] - prev['open'])
-    candle_range = last['high'] - last['low'] + 1e-9
+    body = abs(last["close"] - last["open"])
+    high_wick = last["high"] - max(last["close"], last["open"])
+    low_wick = min(last["close"], last["open"]) - last["low"]
+    candle_range = last["high"] - last["low"] + 1e-9
 
-    # bullish engulfing
-    if last['close'] > last['open'] and prev['close'] < prev['open'] and last['close'] > prev['open'] and last['open'] < prev['close'] and body > prev_body:
-        return True, "bull_engulf"
-    # bearish engulfing
-    if last['close'] < last['open'] and prev['close'] > prev['open'] and last['close'] < prev['open'] and last['open'] > prev['close'] and body > prev_body:
-        return True, "bear_engulf"
-    # hammer/long lower wick
-    lower_wick = min(last['open'], last['close']) - last['low']
-    upper_wick = last['high'] - max(last['open'], last['close'])
-    if lower_wick > 2 * body and body / candle_range < 0.5:
-        return True, "hammer"
-    if upper_wick > 2 * body and body / candle_range < 0.5:
-        return True, "shooting_star"
-    # doji-like rejection
-    if body < 0.2 * candle_range and (lower_wick > 0.4 * candle_range or upper_wick > 0.4 * candle_range):
-        return True, "doji_reject"
+    # doji-ish
+    if body / candle_range < 0.15:
+        return True, "Doji"
+    # hammer (long lower wick)
+    if low_wick > 2 * body and low_wick / candle_range > 0.5:
+        return True, "Hammer"
+    # shooting star (long upper wick)
+    if high_wick > 2 * body and high_wick / candle_range > 0.5:
+        return True, "ShootingStar"
     return False, ""
 
-def detect_ob_fvg_simple(df: pd.DataFrame) -> List[Tuple[float,float,str]]:
+def detect_order_block_stub(df: pd.DataFrame) -> bool:
     """
-    Heuristic OB/FVG detection on input higher timeframe df.
-    Returns list of zones: (low, high, 'OB'|'FVG')
-    """
-    zones: List[Tuple[float,float,str]] = []
-    if df.shape[0] < 6:
-        return zones
-    recent = df.iloc[-12:]
-    opens = recent['open'].values
-    closes = recent['close'].values
-    highs = recent['high'].values
-    lows = recent['low'].values
-
-    # detect impulsive bars -> OB
-    avg_body = np.nanmean(np.abs(closes - opens)) if len(closes) > 0 else 0
-    for i in range(1, len(recent)-1):
-        body = abs(closes[i] - opens[i])
-        rng = highs[i] - lows[i] if highs[i] - lows[i] > 0 else 1e-9
-        if body > max(avg_body * 1.2, 0) and body > 0.6 * rng:
-            low = min(opens[i], closes[i])
-            high = max(opens[i], closes[i])
-            zones.append((float(low), float(high), "OB"))
-    # FVG: gap between bodies
-    for i in range(1, len(recent)):
-        prev_high_body = max(opens[i-1], closes[i-1])
-        curr_low_body = min(opens[i], closes[i])
-        if curr_low_body - prev_high_body > 0:
-            zones.append((float(prev_high_body), float(curr_low_body), "FVG"))
-        prev_low_body = min(opens[i-1], closes[i-1])
-        curr_high_body = max(opens[i], closes[i])
-        if prev_low_body - curr_high_body > 0:
-            zones.append((float(curr_high_body), float(prev_low_body), "FVG"))
-    # merge overlapping zones
-    merged: List[Tuple[float,float,str]] = []
-    for z in zones:
-        l,h,t = z
-        placed = False
-        for idx, mz in enumerate(merged):
-            ml,mh,mt = mz
-            if (l <= mh * 1.02 and h >= ml * 0.98):  # overlap tolerance
-                nl = min(ml,l)
-                nh = max(mh,h)
-                merged[idx] = (nl, nh, mt)
-                placed = True
-                break
-        if not placed:
-            merged.append(z)
-    return merged
-
-def detect_divergence_simple(df: pd.DataFrame, lookback: int = 30) -> Tuple[bool,str]:
-    """
-    Very simple divergence detection using last lookback bars on RSI vs price.
-    Returns (found, 'bull'/'bear')
+    Simple heuristic stub: check strong directional candle followed by consolidation
+    (for production you'd implement full SMC/ICT OB detection).
     """
     if df.shape[0] < 10:
-        return False, ""
-    series = df['close'].values[-lookback:]
-    r = rsi(df['close'], 14).values[-lookback:]
-    # get two recent lows/highs by naive method (indices)
-    if len(series) < 6:
-        return False, ""
-    # low detection
-    lows_idx = np.argsort(series)[:4]
-    highs_idx = np.argsort(-series)[:4]
-    try:
-        i1,i2 = np.sort(lows_idx)[:2]
-        if i2 > i1 and series[-lookback + i2] < series[-lookback + i1] and r[-lookback + i2] > r[-lookback + i1]:
-            return True, "bull"
-    except Exception:
-        pass
-    try:
-        j1,j2 = np.sort(highs_idx)[:2]
-        if j2 > j1 and series[-lookback + j2] > series[-lookback + j1] and r[-lookback + j2] < r[-lookback + j1]:
-            return True, "bear"
-    except Exception:
-        pass
-    return False, ""
+        return False
+    # find candle with big volume/ range in past 10
+    recent = df.iloc[-10:]
+    rng = recent["high"] - recent["low"]
+    avg_rng = rng.mean()
+    last_range = recent.iloc[-5:]["high"].max() - recent.iloc[-5:]["low"].min()
+    return last_range > 1.5 * avg_rng
 
-# -----------------------------
-# Helper: proximity check
-# -----------------------------
-def is_price_near_zone(price: float, zone: Tuple[float,float], tolerance_pct: float = 0.03) -> bool:
-    low, high = zone
-    tol_low = low * (1 - tolerance_pct)
-    tol_high = high * (1 + tolerance_pct)
-    return (tol_low <= price <= tol_high)
+def detect_fvg_stub(df: pd.DataFrame) -> bool:
+    # Fair value gap stub -- check 3-candle gap: middle candle's body doesn't overlap neighbors
+    if df.shape[0] < 3:
+        return False
+    a, b, c = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+    # bullish fvg
+    if b["high"] < a["low"] or b["low"] > a["high"]:
+        return True
+    return False
 
-# -----------------------------
-# End of Part 1
-# -----------------------------
-# Now request Part 2 to continue (scoring, evaluation pipeline, persistence, message formatting)
-# -----------------------------
-# Part 2/3
-# Scoring, Evaluation pipeline, Persistence, Message formatting
-# -----------------------------
-
-# -----------------------------
-# Scoring weights (Hybrid model)
-# -----------------------------
-SCORES_WEIGHTS = {
-    "bias_alignment": 25,     # EMA bias 4H+1H matches signal side
-    "rsi_alignment": 10,      # RSI (15m) direction matches side
-    "ob_fvg": 20,             # OB/FVG presence on H4/H1 near price
-    "divergence": 15,         # divergence on 1H (strong)
-    "reversal_htf": 15,       # reversal candle on 1H/4H
-    "ema_cross_15": 10,       # ema20/50 cross on 15m
-    "fib_proximity": 10,      # price near fib zone / inside OB
-    "volume": 5               # volume confirmation on 15m
-}
-SCORE_MAX_SUM = sum(SCORES_WEIGHTS.values())  # used to normalize
-
-# -----------------------------
-# Utility: load & save signals history
-# -----------------------------
-def load_history() -> List[Dict[str, Any]]:
-    try:
-        if os.path.exists(SIGNALS_FILE):
-            with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        logger.exception("load_history failed")
-    return []
-
-def save_history(history: List[Dict[str, Any]]):
-    try:
-        with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logger.exception("save_history failed")
-
-def append_signal_history(record: Dict[str, Any]):
-    h = load_history()
-    h.append(record)
-    save_history(h)
-
-# -----------------------------
-# Helper: compute bias (4H + 1H)
-# -----------------------------
-def compute_bias(df_4h: pd.DataFrame, df_1h: pd.DataFrame) -> str:
-    """Return 'LONG','SHORT','NEUTRAL' based on EMA50 vs EMA200 on 4H and EMA20/50 on 1H"""
-    try:
-        c4 = df_4h['close']
-        c1 = df_1h['close']
-        ema50_4 = ema(c4, 50).iloc[-1] if len(c4) > 50 else ema(c4, 50).iloc[-1]
-        ema200_4 = ema(c4, 200).iloc[-1] if len(c4) > 200 else ema(c4, 200).iloc[-1]
-        ema20_1 = ema(c1, 20).iloc[-1]
-        ema50_1 = ema(c1, 50).iloc[-1]
-        long_votes = 0
-        short_votes = 0
-        if ema50_4 > ema200_4:
-            long_votes += 1
-        elif ema50_4 < ema200_4:
-            short_votes += 1
-        if ema20_1 > ema50_1:
-            long_votes += 1
-        elif ema20_1 < ema50_1:
-            short_votes += 1
-        if long_votes > short_votes:
-            return "LONG"
-        if short_votes > long_votes:
-            return "SHORT"
-        return "NEUTRAL"
-    except Exception:
-        return "NEUTRAL"
-
-# -----------------------------
-# Evaluate single symbol (Hybrid rules)
-# -----------------------------
-def evaluate_symbol_hybrid(symbol: str) -> Dict[str, Any]:
+def compute_score(metrics: Dict[str, Any]) -> int:
     """
-    Main evaluation for a single symbol.
-    Returns a dict with keys: symbol, score, kind, side, entry, sl, tp1, tp2, note, components
+    Combine various signals to produce a confidence score 0-100.
+    Weighted simple sum.
     """
-    out = {
-        "symbol": symbol,
-        "score": 0.0,
-        "kind": "NONE",
-        "side": None,
-        "entry": None,
-        "sl": None,
-        "tp1": None,
-        "tp2": None,
-        "note": "",
-        "components": {}
-    }
+    score = 0
+    # EMA alignment on 15m
+    if metrics.get("ema20_above_50"):
+        score += 30
+    # RSI confirmation
+    r = metrics.get("rsi15", 50)
+    if metrics.get("side") == "LONG":
+        if r > 70: score += 25
+        elif r > 55: score += 15
+    else:
+        if r < 30: score += 25
+        elif r < 45: score += 15
+    # reversal candle
+    if metrics.get("reversal"):
+        score += 15
+    # OB / FVG
+    if metrics.get("order_block"):
+        score += 10
+    if metrics.get("fvg"):
+        score += 10
+    # cap
+    return min(100, int(score))
+
+# ----------------------------
+# Analysis per symbol
+# ----------------------------
+def analyze_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Multi-timeframe analysis:
+    - 4H: look for reversal candle + swing (for bias)
+    - 1H: confirm OB/FVG + reversal
+    - 15m: EMA20/50, RSI(15), reversal candlestick, divergence stub
+    Return signal dict or None.
+    """
     try:
-        # fetch HTFs and LTFs concurrently (light threading to avoid serial waits)
-        api_sym = symbol.replace("/", "_").replace(".P", "").replace(".", "_")
-        df_4h = fetch_ohlcv(api_sym, timeframe="4h", limit=200)
-        df_1h = fetch_ohlcv(api_sym, timeframe="1h", limit=200)
-        df_30m = fetch_ohlcv(api_sym, timeframe="30m", limit=200)
-        df_15m = fetch_ohlcv(api_sym, timeframe="15m", limit=200)
+        # fetch klines for 15m, 1h, 4h
+        df15 = fetch_klines(symbol, interval="15m", limit=200)
+        df1h = fetch_klines(symbol, interval="1h", limit=200)
+        df4h = fetch_klines(symbol, interval="4h", limit=200)
+        if df15.empty or df1h.empty or df4h.empty:
+            logging.debug("Skipped %s due to empty klines", symbol)
+            return None
 
-        if df_4h.empty or df_1h.empty or df_15m.empty:
-            return out
+        # compute indicators
+        df15["ema20"] = ema(df15["close"], 20)
+        df15["ema50"] = ema(df15["close"], 50)
+        df15["rsi15"] = rsi(df15["close"], period=15)
 
-        # compute bias
-        bias = compute_bias(df_4h, df_1h)
-        out["components"]["bias"] = bias
+        df1h["rsi1h"] = rsi(df1h["close"], period=14)
+        df4h["rsi4h"] = rsi(df4h["close"], period=14)
 
-        last_price = float(df_15m["close"].iloc[-1])
+        # Determine side bias from 4h/1h
+        latest4h = df4h["close"].iloc[-1]
+        ema50_4h = ema(df4h["close"], 50).iloc[-1]
+        side_bias = "LONG" if latest4h > ema50_4h else "SHORT"
 
-        # detect OB/FVG on 4H and 1H
-        zones_4h = detect_ob_fvg_simple(df_4h)
-        zones_1h = detect_ob_fvg_simple(df_1h)
-        ob_found = False
-        ob_zone = None
-        for z in zones_4h + zones_1h:
-            if is_price_near_zone(last_price, (z[0], z[1]), tolerance_pct=0.04):
-                ob_found = True
-                ob_zone = z
-                break
-        out["components"]["ob_found"] = ob_found
-        out["components"]["ob_zone"] = ob_zone
+        # 15m cross
+        ema20_above_50 = df15["ema20"].iloc[-1] > df15["ema50"].iloc[-1]
 
-        # divergence on 1H
-        div_found, div_type = detect_divergence_simple(df_1h)
-        out["components"]["divergence"] = div_found
-        out["components"]["div_type"] = div_type
+        # reversal on higher tf (4h or 1h)
+        rev4h, rev4h_type = detect_reversal_candle(df4h)
+        rev1h, rev1h_type = detect_reversal_candle(df1h)
 
-        # reversal on 1H/4H
-        rev1_found, rev1_type = detect_reversal_candle(df_1h)
-        rev4_found, rev4_type = detect_reversal_candle(df_4h)
-        out["components"]["rev1"] = (rev1_found, rev1_type)
-        out["components"]["rev4"] = (rev4_found, rev4_type)
+        # detection on 15m
+        rev15, rev15_type = detect_reversal_candle(df15)
+        order_block = detect_order_block_stub(df1h) or detect_order_block_stub(df4h)
+        fvg = detect_fvg_stub(df1h) or detect_fvg_stub(df15)
 
-        # LTF confirmation 15m: EMA cross + RSI + reversal 15m
-        EMA20_15 = ema(df_15m['close'], 20).iloc[-1]
-        EMA50_15 = ema(df_15m['close'], 50).iloc[-1]
-        ema_cross_15_flag = EMA20_15 > EMA50_15
-        rsi_15_val = rsi(df_15m['close'], 14).iloc[-1]
-        rev15_found, rev15_type = detect_reversal_candle(df_15m)
-        vol15 = df_15m['volume'].iloc[-1] if 'volume' in df_15m.columns else 0
-        vol_avg = df_15m['volume'].rolling(20).mean().iloc[-1] if df_15m.shape[0] >= 20 else vol15
-        vol_ok = (vol15 >= (vol_avg * 0.6)) if not math.isnan(vol_avg) and vol_avg > 0 else True
-
-        out["components"]["ema20_50_15"] = ema_cross_15_flag
-        out["components"]["rsi15"] = float(round(rsi_15_val,2))
-        out["components"]["rev15"] = (rev15_found, rev15_type)
-        out["components"]["vol_ok"] = vol_ok
-
-        # Decide candidate side using hybrid logic:
-        # prefer bias from HTF; require alignment with divergence/reversal
-        side = None
-        if bias == "LONG":
-            # HTF long bias -> prefer bull divergence or HTF reversal bullish
-            if (div_found and div_type == "bull") or (rev1_found and rev1_type in ("bull_engulf","hammer","doji_reject")) or (rev4_found and rev4_type in ("bull_engulf","hammer","doji_reject")):
-                side = "LONG"
-        elif bias == "SHORT":
-            if (div_found and div_type == "bear") or (rev1_found and rev1_type in ("bear_engulf","shooting_star","doji_reject")) or (rev4_found and rev4_type in ("bear_engulf","shooting_star","doji_reject")):
-                side = "SHORT"
+        rsi15_val = float(df15["rsi15"].iloc[-1]) if not df15["rsi15"].empty else 50.0
+        # final side decision
+        side = side_bias
+        # but if 15m EMAs opposite, override
+        if ema20_above_50:
+            side = "LONG"
         else:
-            # if neutral bias, require strong HTF signal or 30m+15m alignment
-            if rev1_found:
-                side = "LONG" if rev1_type.startswith("bull") else "SHORT" if rev1_type.startswith("bear") else None
-            elif div_found:
-                side = "LONG" if div_type == "bull" else "SHORT"
+            side = "SHORT"
 
-        out["side"] = side
+        metrics = {
+            "symbol": symbol,
+            "side": side,
+            "ema20_above_50": ema20_above_50,
+            "rsi15": rsi15_val,
+            "reversal": rev15 or rev1h or rev4h,
+            "reversal_type": rev15_type or rev1h_type or rev4h_type,
+            "order_block": order_block,
+            "fvg": fvg,
+            "4h_rev": rev4h,
+            "1h_rev": rev1h,
+            "score": 0
+        }
+        metrics["score"] = compute_score(metrics)
 
-        # Now scoring:
-        score = 0.0
-        # bias alignment
-        if side and bias != "NEUTRAL" and side == bias:
-            score += SCORES_WEIGHTS["bias_alignment"]
-            out["components"]["bias_aligned"] = True
-        else:
-            out["components"]["bias_aligned"] = False
-
-        # rsi alignment on 15m
-        if side == "LONG" and rsi_15_val > 50:
-            score += SCORES_WEIGHTS["rsi_alignment"]
-            out["components"]["rsi_ok"] = True
-        elif side == "SHORT" and rsi_15_val < 50:
-            score += SCORES_WEIGHTS["rsi_alignment"]
-            out["components"]["rsi_ok"] = True
-        else:
-            out["components"]["rsi_ok"] = False
-
-        # ob/fvg
-        if ob_found:
-            score += SCORES_WEIGHTS["ob_fvg"]
-
-        # divergence
-        if div_found:
-            score += SCORES_WEIGHTS["divergence"]
-
-        # reversal HTF
-        if rev1_found or rev4_found:
-            score += SCORES_WEIGHTS["reversal_htf"]
-
-        # EMA cross 15
-        if ema_cross_15_flag:
-            score += SCORES_WEIGHTS["ema_cross_15"]
-
-        # fib proximity approximated by ob_found
-        if ob_found:
-            score += SCORES_WEIGHTS["fib_proximity"]
-
-        # volume
-        if vol_ok:
-            score += SCORES_WEIGHTS["volume"]
-
-        # penalty: if HTF RSI overbought in opposite direction
-        if side == "LONG" and rsi(df_4h['close'], 14).iloc[-1] > 75:
-            score -= 15
-            out["components"]["penalty_htf_rsi"] = "4H_RSI_high"
-        if side == "SHORT" and rsi(df_4h['close'], 14).iloc[-1] < 25:
-            score -= 15
-            out["components"]["penalty_htf_rsi"] = "4H_RSI_low"
-
-        # normalize
-        score = max(0.0, score)
-        score_norm = round((score / SCORE_MAX_SUM) * 100.0, 1)
-        out["score"] = score_norm
-
-        # determine kind
-        if score_norm >= CONF_THRESHOLD:
+        # classify as CONFIRMED / NEAR / PRE
+        kind = None
+        if metrics["score"] >= MIN_CONF_PERCENT and metrics["order_block"] and metrics["reversal"]:
             kind = "CONFIRMED"
-        elif score_norm >= NEAR_THRESHOLD:
+        elif metrics["score"] >= int(MIN_CONF_PERCENT * 0.7) and (metrics["reversal"] or metrics["fvg"]):
             kind = "NEAR"
-        elif score_norm >= 50.0:
+        elif metrics["score"] >= int(MIN_CONF_PERCENT * 0.5):
             kind = "PRE"
         else:
-            kind = "NONE"
-        out["kind"] = kind
+            return None  # not worthy
 
-        # If no side or kind NONE -> return
-        if kind == "NONE" or side is None:
-            return out
-
-        # Determine entries and SL/TP using ATR and candle tails
-        # prefer entry = current price, SL = tail of 15m reversal candle if exists, else 1*ATR
-        last_price = float(df_15m['close'].iloc[-1])
-        atr15 = float(atr(df_15m, 14).iloc[-1]) if df_15m.shape[0] >= 14 else (df_15m['high'].iloc[-1] - df_15m['low'].iloc[-1])
-        if atr15 <= 0 or math.isnan(atr15):
-            atr15 = max(1e-6, last_price * 0.001)
-
-        entry = last_price
-        if rev15_found:
-            # tail as SL
-            last_c = df_15m.iloc[-1]
-            if side == "LONG":
-                sl = float(last_c['low']) - (atr15 * 0.1)
-            else:
-                sl = float(last_c['high']) + (atr15 * 0.1)
-        else:
-            if side == "LONG":
-                sl = entry - (atr15 * 1.0)
-            else:
-                sl = entry + (atr15 * 1.0)
-
-        # compute R and targets
+        last_close = df15["close"].iloc[-1]
+        # calculate basic TP/SL using ATR-like logic or Fibonacci stub
+        atr = (df15["high"] - df15["low"]).rolling(14).mean().iloc[-1] if df15.shape[0] > 14 else (df15["high"] - df15["low"]).mean()
+        if math.isnan(atr) or atr <= 0:
+            atr = last_close * 0.002  # fallback 0.2%
+        # Targets: TP1 = 1 ATR, TP2 = 2 ATR, SL at tail of reversal candlestick
         if side == "LONG":
-            R = entry - sl if entry > sl else atr15
-            tp1 = entry + R * 1.0
-            tp2 = entry + R * 2.5
+            tp1 = last_close + atr
+            tp2 = last_close + 2 * atr
+            sl = last_close - 1.5 * atr
         else:
-            R = sl - entry if sl > entry else atr15
-            tp1 = entry - R * 1.0
-            tp2 = entry - R * 2.5
+            tp1 = last_close - atr
+            tp2 = last_close - 2 * atr
+            sl = last_close + 1.5 * atr
 
-        out["entry"] = round(entry, 8)
-        out["sl"] = round(sl, 8)
-        out["tp1"] = round(tp1, 8)
-        out["tp2"] = round(tp2, 8)
-        out["note"] = f"bias={bias} | ob={ob_found} | div={div_found} | rev1={rev1_found} rev4={rev4_found} | rsi15={round(rsi_15_val,2)}"
+        # Respect Fibonacci stop removal: if user wants stop at tail of candle, attempt to set sl near last low/high
+        if metrics["reversal"]:
+            if side == "LONG":
+                sl = min(sl, df15["low"].iloc[-1])
+            else:
+                sl = max(sl, df15["high"].iloc[-1])
 
+        signal = {
+            "symbol": symbol.replace("USDT", "USDT.P") if "USDT" in symbol and ".P" not in symbol else symbol,
+            "side": side,
+            "entry": round(last_close, 8),
+            "sl": round(sl, 8),
+            "tp1": round(tp1, 8),
+            "tp2": round(tp2, 8),
+            "rsi15": round(metrics["rsi15"], 2),
+            "score": metrics["score"],
+            "kind": kind,
+            "note": f"EMA20>50:{metrics['ema20_above_50']} | OB:{metrics['order_block']} | FVG:{metrics['fvg']} | rev:{metrics['reversal_type']}",
+            "time": now_iso()
+        }
+        return signal
     except Exception as e:
-        logger.exception("evaluate_symbol_hybrid error %s", e)
-    return out
+        logging.exception("analyze_symbol error %s: %s", symbol, e)
+        return None
 
-# -----------------------------
-# Format message for Telegram
-# -----------------------------
-def format_signal_text(sig: Dict[str, Any]) -> str:
-    if not sig or sig.get("kind") == "NONE":
-        return ""
-    emoji = "🟢" if sig["kind"] == "CONFIRMED" else "🟡" if sig["kind"] == "NEAR" else "⚪"
-    txt = (
-        f"{emoji} {sig['kind']} — {sig['symbol']}\n"
-        f"SIDE: {sig['side']}  ENTRY: {sig['entry']}\n"
-        f"SL: {sig['sl']}  TP1: {sig['tp1']}  TP2: {sig['tp2']}\n"
-        f"SCORE: {sig['score']}% | {sig.get('note','')}\n"
-        f"⚠️ Analysis only — manual execution recommended. Check liquidity & slippage."
-    )
-    return txt
+# ----------------------------
+# Signals persistence & summary
+# ----------------------------
+def load_signals_history():
+    return load_json_file(HISTORY_FILE, [])
 
-# -----------------------------
-# End of Part 2
-# -----------------------------
-# Ask for Part 3 to receive main loop, scheduling, /marketCondition handler, and final glue.
-# -----------------------------
-# Part 3/3
-# Main loop, reports, Telegram command /marketCondition
-# -----------------------------
+def append_signal_history(sig):
+    history = load_signals_history()
+    history.append(sig)
+    save_json_file(HISTORY_FILE, history)
 
-# -----------------------------
-# 6H summary report
-# -----------------------------
 def build_and_send_6h_summary():
     now = datetime.now(timezone.utc)
     since = now - timedelta(hours=6)
-    hist = load_history()
-    window = []
-    for r in hist:
-        try:
-            t = parser.isoparse(r.get("time")) if isinstance(r.get("time"), str) else None
-            if t and t.replace(tzinfo=timezone.utc) >= since:
-                window.append(r)
-        except Exception:
-            continue
+    signals = load_signals_history()
+    window = [r for r in signals if datetime.fromisoformat(r["time"]).replace(tzinfo=timezone.utc) > since]
     if not window:
-        logger.info("No signals in 6H window.")
+        logging.info("Summary: no signals in the 6h window.")
         return
-    counts = {"CONFIRMED":0,"NEAR":0,"PRE":0}
+
+    report_entries = []
+    counts = {"tp2":0,"tp1":0,"sl":0,"open":0,"unknown":0}
     for rec in window:
-        k = rec.get("kind","NONE")
-        if k in counts: counts[k]+=1
-    txt = f"📈 6H Report — {since.strftime('%H:%M')} → {now.strftime('%H:%M')} UTC\n"
-    txt += "\n".join([f"{r['symbol']} {r['side']} {r['kind']} ({r['score']}%)" for r in window])
-    txt += f"\n\nTotals — CONFIRMED {counts['CONFIRMED']} | NEAR {counts['NEAR']} | PRE {counts['PRE']}"
-    send_telegram_text(txt)
+        # For now we mark status unknown (real status requires trade tracking)
+        st = {"status":"open", "hit_time": None, "hit_price": None}
+        counts[st["status"]] = counts.get(st["status"],0) + 1
+        report_entries.append({
+            "symbol": rec["symbol"],
+            "side": rec["side"],
+            "sent_time": rec["time"],
+            "status": st["status"],
+            "hit_time": st.get("hit_time"),
+            "hit_price": st.get("hit_price"),
+            "entry": rec["entry"],
+            "sl": rec["sl"],
+            "tp1": rec["tp1"],
+            "tp2": rec["tp2"],
+            "kind": rec.get("kind","?"),
+            "note": rec.get("note","")
+        })
+
+    # build text message
+    header = f"📈 WSS 6H Report — {since.strftime('%Y-%m-%d %H:%M')} → {now.strftime('%Y-%m-%d %H:%M')} UTC\n"
+    lines = [header]
+    idx = 1
+    for e in report_entries:
+        status_icon = {"tp2":"✅ TP2","tp1":"🟡 TP1","sl":"🔴 SL","open":"⚪ OPEN","unknown":"❓"}[e["status"] if e["status"] in ["tp2","tp1","sl","open"] else "unknown"]
+        lines.append(f"{idx}) {e['symbol']} — {e['side']} | Kind: {e.get('kind','?')} | {status_icon} | Sent: {e['sent_time']}")
+        if e.get("hit_time"):
+            lines.append(f"    Hit time: {e['hit_time']} | Price: {e.get('hit_price')}")
+        else:
+            lines.append(f"    Entry: {e['entry']} | SL: {e['sl']} | TP1: {e['tp1']} | TP2: {e['tp2']}")
+        if e.get("note"):
+            lines.append(f"    Note: {e['note']}")
+        idx += 1
+
+    lines.append("")
+    lines.append(f"Summary counts — TP2: {counts.get('tp2',0)} | TP1: {counts.get('tp1',0)} | SL: {counts.get('sl',0)} | OPEN: {counts.get('open',0)}")
+
+    send_telegram_text("\n".join(lines))
+
+    # Save JSON report
     try:
-        fname = f"{REPORTS_DIR}/report_{now.strftime('%Y%m%d_%H%M')}.json"
-        with open(fname,"w",encoding="utf-8") as f:
-            json.dump(window,f,indent=2)
-    except Exception:
-        logger.warning("Failed saving 6H file")
+        filename = f"{REPORTS_DIR}/report_{now.strftime('%Y-%m-%d_%HUTC')}.json"
+        report_data = {
+            "start": since.isoformat(),
+            "end": now.isoformat(),
+            "entries": report_entries,
+            "counts": counts
+        }
+        save_json_file(filename, report_data)
+        logging.info(f"Saved summary report to {filename}")
+    except Exception as e:
+        logging.warning(f"Failed to save summary report: {e}")
 
-# -----------------------------
-# Main analysis cycle
-# -----------------------------
-def run_cycle(cycle_no:int):
-    symbols = fetch_symbols_usdt_p(limit=MAX_SYMBOLS)
-    if not symbols:
-        logger.warning("No USDT.P symbols found.")
-        return
-    logger.info("Cycle #%d → Analyzing %d symbols ...",cycle_no,len(symbols))
-    sent=0; conf=0; near=0; pre=0; longc=0; shortc=0
-    for s in symbols:
-        try:
-            sig = evaluate_symbol_hybrid(s)
-            if not sig or sig["kind"]=="NONE" or not sig["side"]:
+# ----------------------------
+# Market condition summary (simple)
+# ----------------------------
+def market_condition_report() -> str:
+    # Very simple: sample RSI/EMA across a subset of symbols
+    try:
+        syms = current_symbols[:min(30, len(current_symbols))]
+        longs = 0
+        shorts = 0
+        for s in syms:
+            df1h = fetch_klines(s, interval="1h", limit=50)
+            if df1h.empty: 
                 continue
-            if sig["side"]=="LONG": longc+=1
-            elif sig["side"]=="SHORT": shortc+=1
-            if sig["kind"]=="CONFIRMED": conf+=1
-            elif sig["kind"]=="NEAR": near+=1
-            elif sig["kind"]=="PRE": pre+=1
-            # send only CONFIRMED/NEAR
-            if sig["kind"] in ("CONFIRMED","NEAR"):
-                msg = format_signal_text(sig)
-                send_telegram_text(msg)
-                sig_rec = {**sig,"time":datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()}
-                append_signal_history(sig_rec)
-                sent+=1
-        except Exception:
-            logger.exception("Error in %s",s)
-            continue
-    summary=f"📊 Cycle done — Total {len(symbols)} | Sent {sent} | Confirmed {conf} | Near {near} | Pre {pre} | Longs {longc} | Shorts {shortc}"
-    send_telegram_text(summary)
-    logger.info(summary)
+            ema50 = ema(df1h["close"], 50).iloc[-1]
+            cur = df1h["close"].iloc[-1]
+            if cur > ema50:
+                longs += 1
+            else:
+                shorts += 1
+        total = longs + shorts
+        if total == 0:
+            return "Market condition: insufficient data."
+        long_pct = (longs / total) * 100
+        if long_pct > 60:
+            trend = "Bullish (short/medium term)"
+        elif long_pct < 40:
+            trend = "Bearish (short/medium term)"
+        else:
+            trend = "Neutral / mixed"
+        return f"📈 Market Condition: {trend} — Sampled {total} pairs — Longs: {longs} | Shorts: {shorts}"
+    except Exception as e:
+        logging.exception("market_condition_report failed")
+        return "Market condition: error calculating."
 
-# -----------------------------
-# Telegram command: /marketCondition
-# -----------------------------
-if bot:
-    @bot.message_handler(commands=["marketCondition"])
-    def handle_market(message):
-        try:
-            syms=fetch_symbols_usdt_p(limit=40)
-            l=0;s=0;n=0
-            for sname in syms:
-                df4=fetch_ohlcv(sname.replace("/","_").replace(".P",""),"4h",200)
-                if df4.empty: continue
-                ema50=ema(df4["close"],50).iloc[-1]; ema200=ema(df4["close"],200).iloc[-1]
-                if ema50>ema200: l+=1
-                elif ema50<ema200: s+=1
-                else: n+=1
-            total=l+s+n
-            if total==0:
-                bot.send_message(message.chat.id,"No data.")
-                return
-            txt=f"📈 Market Condition\nLONG {l} ({round(l/total*100)}%) | SHORT {s} ({round(s/total*100)}%) | Neutral {n}"
-            bot.send_message(message.chat.id,txt)
-        except Exception as e:
-            bot.send_message(message.chat.id,f"Error {e}")
+# ----------------------------
+# Main scanning cycle
+# ----------------------------
+current_symbols: List[str] = []
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
-def main():
-    send_telegram_text("🚀 WSS Hybrid Pro v3 started — monitoring USDT.P pairs.")
+def cycle_once():
+    global current_symbols
+    try:
+        # discover symbols
+        syms = fetch_symbols_usdt_p(limit=SCAN_LIMIT)
+        # normalize to X/USDT.P format for internal usage
+        normalized = []
+        for s in syms:
+            s2 = s
+            if "/" not in s2:
+                # try to clean forms like BTCUSDT -> BTC/USDT.P
+                if s2.endswith("USDT") or s2.endswith("USDT.P"):
+                    base = s2.replace("USDT.P", "").replace("USDT", "")
+                    s2 = f"{base}/USDT.P"
+            if s2.endswith("USDT"):
+                s2 = s2.replace("USDT", "USDT.P")
+                if "/" not in s2 and s2.count("USDT.P") > 0:
+                    # fallback
+                    pass
+            normalized.append(s2)
+        current_symbols = normalized[:MAX_PAIRS]
+        logging.info("Monitoring %d USDT.P symbols (limit %d). CONFIRMED ≥ %d%%", len(current_symbols), SCAN_LIMIT, MIN_CONF_PERCENT)
+
+        found = []
+        sent = 0
+        confirmed = 0
+        near = 0
+        longs = 0
+        shorts = 0
+
+        start = datetime.utcnow()
+        for idx, sym in enumerate(current_symbols):
+            s = analyze_symbol(sym)
+            if not s:
+                continue
+            found.append(s)
+            if s["side"] == "LONG":
+                longs += 1
+            else:
+                shorts += 1
+            # decide to send message only for CONFIRMED and NEAR (user requirement); CONFIRMED priority
+            if s["kind"] == "CONFIRMED":
+                confirmed += 1
+                # send to telegram
+                msg = format_signal_message(s)
+                ok = send_telegram_text(msg)
+                if ok:
+                    sent += 1
+                append_signal_history(s)
+            elif s["kind"] == "NEAR":
+                near += 1
+                # user wanted NEAR to be sent as full trade as well
+                msg = format_signal_message(s)
+                ok = send_telegram_text(msg)
+                if ok:
+                    sent += 1
+                append_signal_history(s)
+            else:
+                # PRE: store in history but do not spam TG
+                append_signal_history(s)
+
+        duration = (datetime.utcnow() - start).seconds
+        logging.info("Cycle done — Total: %d | Sent: %d | Confirmed: %d | Near: %d | Longs: %d | Shorts: %d", len(found), sent, confirmed, near, longs, shorts)
+        # send compact cycle summary once per cycle
+        summary = f"📊 Cycle done — Total: {len(found)} | Sent: {sent} | Confirmed: {confirmed} | Near: {near} | Longs: {longs} | Shorts: {shorts}\nDuration:{duration}s"
+        send_telegram_text(summary)
+    except Exception as e:
+        logging.exception("cycle_once failed: %s", e)
+
+def format_signal_message(s: Dict[str, Any]) -> str:
+    icon = "🟢" if s["side"] == "LONG" else "🔴"
+    kind_tag = "CONFIRMED" if s["kind"] == "CONFIRMED" else ("🟡 NEAR" if s["kind"] == "NEAR" else "PRE")
+    msg = (
+        f"{icon} {kind_tag} — {s['symbol']}\n"
+        f"SIDE: {s['side']}  ENTRY: {s['entry']}\n"
+        f"SL: {s['sl']}  TP1: {s['tp1']}  TP2: {s['tp2']}\n\n"
+        f"RSI(15m): {s['rsi15']} | SCORE: {s['score']}%\n"
+        f"Notes: {s.get('note','')}\n\n"
+        "⚠️ هذا تحليل فقط — لا أوامر تلقائية. تأكد من السيولة، الانزلاق، والعمولات قبل التنفيذ."
+    )
+    return msg
+
+# ----------------------------
+# Main loop + scheduling
+# ----------------------------
+def main_loop():
+    # start optional telegram polling thread
+    if TELEGRAM_POLLING_ENABLED:
+        t = threading.Thread(target=telegram_poll_loop, daemon=True)
+        t.start()
+
+    # initial 6h summary on start
     try:
         build_and_send_6h_summary()
     except Exception:
-        logger.warning("6H summary init failed.")
-    cycle=0
-    while True:
-        cycle+=1
-        try:
-            run_cycle(cycle)
-            now=datetime.utcnow()
-            if now.hour%6==0 and now.minute<=(CYCLE_INTERVAL/60):
-                build_and_send_6h_summary()
-        except Exception:
-            logger.exception("Cycle error")
-        logger.info("Sleeping %d s ...",CYCLE_INTERVAL)
-        time.sleep(CYCLE_INTERVAL)
+        logging.debug("initial 6H summary skipped")
 
-if __name__=="__main__":
+    while True:
+        try:
+            cycle_once()
+        except Exception:
+            logging.exception("Unhandled exception in main loop")
+        logging.info("Sleeping %d seconds until next cycle.", CYCLE_INTERVAL_SEC)
+        time.sleep(CYCLE_INTERVAL_SEC)
+
+# ----------------------------
+# Small CLI helpers
+# ----------------------------
+if __name__ == "__main__":
+    logging.info("WSS Hybrid Analytical Bot v5 starting — monitoring symbols. Risk per trade: $%s", RISK_USD)
     try:
-        if bot:
-            threading.Thread(target=bot.polling,kwargs={"none_stop":True,"interval":2},daemon=True).start()
-        main()
+        main_loop()
     except KeyboardInterrupt:
-        logger.info("Stopped by user.")
+        logging.info("Shutting down by user request.")
     except Exception:
-        logger.exception("Fatal error in main")
+        logging.exception("Fatal error, exiting.")
