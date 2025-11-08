@@ -1,1 +1,1 @@
-worker: python WSS_Local_Pro.py
+worker: python main.py
