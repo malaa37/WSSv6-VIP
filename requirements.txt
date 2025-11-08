@@ -1,7 +1,6 @@
-ccxt
-numpy
-pyTelegramBotAPI
-flask
 requests
-python-dateutil
 pandas
+numpy
+python-dateutil
+pyTelegramBotAPI
+ta
