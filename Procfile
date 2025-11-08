@@ -1,1 +1,1 @@
-worker: python main_Hybrid_Pro_v3.py
+worker: python WSS_Local_Pro.py
