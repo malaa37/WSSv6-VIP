@@ -1,65 +1,56 @@
 #!/usr/bin/env python3
-# main.py — WSS Smart Entry v2.4 (analysis-only, MEXC Futures)
-# Requirements: pip install ccxt requests pandas numpy python-dateutil
+# main.py — WSS Smart Entry v2.5 (Final Futures Version)
 
 import os
 import time
 import json
-import io
 import logging
-import traceback
+import requests
+import pandas as pd
+import numpy as np
+import ccxt
 from datetime import datetime, timedelta, timezone
 from time import sleep
-from typing import List, Dict, Any
-
-import ccxt
-import numpy as np
-import pandas as pd
-import requests
-from dateutil import parser as dateparser
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ---------------------------
-# CONFIG (from ENV)
+# CONFIGURATION
 # ---------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
 
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "900"))        # default 15 minutes
-REQUEST_DELAY_MS = int(os.getenv("REQUEST_DELAY_MS", "200"))  # pause between requests
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "900"))        # كل 15 دقيقة
+REQUEST_DELAY_MS = int(os.getenv("REQUEST_DELAY_MS", "200"))
 MONITOR_LIMIT = int(os.getenv("MONITOR_LIMIT", "500"))
-SEND_TELEGRAM = os.getenv("SEND_TELEGRAM", "1") in ("1", "true", "True")
 
-CONFIRMED_THRESHOLD = 85   # CONFIRMED >= 85%
+SEND_TELEGRAM = os.getenv("SEND_TELEGRAM", "1") in ("1", "true", "True")
+CONFIRMED_THRESHOLD = 85
 NEAR_THRESHOLD = 60
 
 SIGNALS_FILE = "signals_history.json"
 REPORTS_DIR = "reports"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("WSS-v2.4")
-
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+logger = logging.getLogger("WSS-v2.5")
 
 # ---------------------------
-# Telegram Functions
+# TELEGRAM FUNCTIONS
 # ---------------------------
-def send_telegram_text(text: str):
+def send_telegram_text(text):
     if not SEND_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-        r = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=15)
+        r = requests.post(url, json=payload, timeout=15)
         return r.status_code == 200
     except Exception as e:
-        logger.warning(f"TG send failed: {e}")
+        logger.warning(f"Telegram send failed: {e}")
         return False
 
 # ---------------------------
-# Exchange Setup
+# EXCHANGE FUNCTIONS
 # ---------------------------
 def init_mexc():
     try:
@@ -68,45 +59,57 @@ def init_mexc():
             params.update({"apiKey": MEXC_API_KEY, "secret": MEXC_API_SECRET})
         ex = ccxt.mexc(params)
         ex.load_markets()
-        logger.info("Connected to MEXC (read-only).")
+        logger.info("Connected to MEXC Futures API.")
         return ex
     except Exception as e:
         logger.error(f"MEXC init failed: {e}")
         return None
 
+
 def discover_symbols(exchange, suffixs=["USDT.P"], limit=MONITOR_LIMIT):
+    """اكتشاف الأزواج المنتهية بـ USDT.P فقط من قسم FUTURES"""
     try:
         markets = exchange.load_markets()
     except Exception as e:
         logger.warning(f"load_markets failed: {e}")
         markets = {}
+
     out = []
-    for sym in markets.keys():
+    for sym, data in markets.items():
         s_up = sym.upper()
-        if any(s_up.endswith(suf) for suf in suffixs):
+        # ✅ تأكد أن الزوج فعلاً من نوع FUTURE
+        if "future" in str(data.get("type", "")).lower() or data.get("future", False):
+            if s_up.endswith("USDT.P"):
+                out.append(sym)
+        elif s_up.endswith("USDT.P"):
             out.append(sym)
         if len(out) >= limit:
             break
-    logger.info(f"Discovered {len(out)} symbols ending with USDT.P")
+
+    # ✅ فلترة إضافية
+    out = [s for s in out if s.upper().endswith("USDT.P")]
+    logger.info(f"✅ Discovered {len(out)} USDT.P futures pairs.")
     return out
+
 
 def safe_fetch_ohlcv(ex, symbol, timeframe="15m", limit=200):
     try:
         return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except:
+    except Exception:
         return []
 
+
 # ---------------------------
-# Indicators
+# INDICATORS & DETECTION
 # ---------------------------
 def ema(arr, period):
     return pd.Series(arr).ewm(span=period, adjust=False).mean().to_numpy()
 
 def rsi_from_series(arr, period=14):
-    a = np.asarray(arr, dtype=float)
-    if a.size < period + 1:
+    arr = np.asarray(arr, dtype=float)
+    if len(arr) < period + 1:
         return None
-    delta = np.diff(a)
+    delta = np.diff(arr)
     up, down = delta.clip(min=0), -delta.clip(max=0)
     rs = up.mean() / (down.mean() + 1e-12)
     return 100 - (100 / (1 + rs))
@@ -127,14 +130,16 @@ def detect_reversal_candle(ohlcv):
         return "shooting_star"
     return None
 
+
 # ---------------------------
-# Strategy Core
+# STRATEGY CORE
 # ---------------------------
 def evaluate_symbol_strategy(ex, symbol):
     o4h = safe_fetch_ohlcv(ex, symbol, "4h", 120)
     o1h = safe_fetch_ohlcv(ex, symbol, "1h", 160)
     if not o4h or not o1h:
         return None
+
     rev4h = detect_reversal_candle(o4h)
     rev1h = detect_reversal_candle(o1h)
     side = None
@@ -151,15 +156,19 @@ def evaluate_symbol_strategy(ex, symbol):
     rsi15 = rsi_from_series(closes15, 15) or 50
     ema_ok = (ema20[-1] > ema50[-1]) if side == "LONG" else (ema20[-1] < ema50[-1])
     rsi_ok = (rsi15 > 50) if side == "LONG" else (rsi15 < 50)
+
     score = 0
     if ema_ok: score += 40
     if rsi_ok: score += 45
     if rev4h or rev1h: score += 15
+
     kind = "CONFIRMED" if score >= CONFIRMED_THRESHOLD else ("NEAR" if score >= NEAR_THRESHOLD else "PRE")
+
     price = closes15[-1]
     sl = o4h[-1][3] if side == "LONG" else o4h[-1][2]
     tp1 = price * (1.015 if side == "LONG" else 0.985)
     tp2 = price * (1.03 if side == "LONG" else 0.97)
+
     return {
         "time": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol,
@@ -177,14 +186,15 @@ def format_signal(sig):
     icon = "🟢" if sig["kind"] == "CONFIRMED" else "🟡"
     return (
         f"{icon} {sig['kind']} — {sig['symbol']}\n"
-        f"SIDE: {sig['side']} ENTRY: {sig['entry']}\n"
+        f"SIDE: {sig['side']}  ENTRY: {sig['entry']}\n"
         f"SL: {sig['sl']}  TP1: {sig['tp1']}  TP2: {sig['tp2']}\n"
         f"RSI(15m): {sig['rsi15']} | SCORE: {sig['score_percent']}%\n"
-        "⚠️ Analysis only — no automatic orders."
+        f"⚠️ Analysis only — no automatic orders."
     )
 
+
 # ---------------------------
-# Persistence
+# PERSISTENCE
 # ---------------------------
 def ensure_files():
     os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -202,8 +212,9 @@ def append_signal(sig):
     with open(SIGNALS_FILE, "w") as f:
         json.dump(arr[-10000:], f, indent=2)
 
+
 # ---------------------------
-# Main Loop
+# MAIN LOOP
 # ---------------------------
 def main():
     ensure_files()
@@ -213,7 +224,7 @@ def main():
         return
 
     symbols = discover_symbols(ex, ["USDT.P"], MONITOR_LIMIT)
-    send_telegram_text(f"✅ WSS Smart Entry v2.4 — Monitoring {len(symbols)} USDT.P pairs.")
+    send_telegram_text(f"✅ WSS Smart Entry v2.5 — Monitoring {len(symbols)} USDT.P pairs.")
 
     cycle = 0
     while True:
@@ -269,6 +280,7 @@ def main():
         sleep_time = max(0, CYCLE_SECONDS - duration)
         logger.info(f"Sleeping {sleep_time}s until next cycle.")
         time.sleep(sleep_time)
+
 
 if __name__ == "__main__":
     try:
