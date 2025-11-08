@@ -1,633 +1,692 @@
-#!/usr/bin/env python3
-# main.py — WSS Smart Entry v2.6 (Full strategy + USDT.P only + cycle summary)
-
-"""
-Requirements:
- pip install ccxt requests pandas numpy python-dateutil
-"""
+# main_vAdvanced.py
+# WSS vAdvanced - main file
+# Author: Generated assistant (adapt for your environment)
+# Notes: put all 3 parts in the same file in order before running.
 
 import os
 import time
 import json
-import io
+import math
 import logging
-import traceback
-from datetime import datetime, timedelta, timezone
-from time import sleep
-from typing import List, Dict, Any
+import threading
+from datetime import datetime, timezone, timedelta
 
+import requests
 import ccxt
 import numpy as np
 import pandas as pd
-import requests
-from dateutil import parser as dateparser
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ---------------------------
-# CONFIG (from ENV)
+# Config (read from env)
 # ---------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
-MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
+MEXC_SECRET = os.getenv("MEXC_SECRET", "")
+RISK_USD = float(os.getenv("RISK_USD", "10.0"))
+SYMBOL_LIMIT = int(os.getenv("SYMBOL_LIMIT", "60"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "900"))  # 900s = 15m
+SUMMARY_INTERVAL_HOURS = int(os.getenv("SUMMARY_INTERVAL_HOURS", "6"))
+REPORTS_DIR = os.getenv("REPORTS_DIR", "reports")
+SIGNALS_FILE = os.getenv("SIGNALS_FILE", "signals_history.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "900"))        # default 15 minutes
-REQUEST_DELAY_MS = int(os.getenv("REQUEST_DELAY_MS", "200"))  # pause between symbol requests (ms)
-MONITOR_LIMIT = int(os.getenv("MONITOR_LIMIT", "500"))       # max symbols to discover/scan
-SEND_TELEGRAM = os.getenv("SEND_TELEGRAM", "1") in ("1", "true", "True")
-LEVERAGE_DEFAULT = int(os.getenv("LEVERAGE_DEFAULT", "50"))
+# Score thresholds
+CONFIRMED_SCORE = float(os.getenv("CONFIRMED_SCORE", "85.0"))
+NEAR_SCORE = float(os.getenv("NEAR_SCORE", "70.0"))
 
-# Strategy thresholds
-CONFIRMED_THRESHOLD = 85   # requires >=85 points (out of 100)
-NEAR_THRESHOLD = 60
+# Limits
+MAX_SENT_PER_CYCLE = int(os.getenv("MAX_SENT_PER_CYCLE", "200"))
 
-# Files
-SIGNALS_FILE = "signals_history.json"
-REPORTS_DIR = "reports"
-
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("WSS-v2.6")
-
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+# Setup logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
 
 # ---------------------------
-# Telegram helpers
+# Utils: Telegram
 # ---------------------------
-def send_telegram_text(text: str) -> bool:
-    if not SEND_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.debug("Telegram disabled or not configured.")
+def send_telegram_text(text: str):
+    if TELEGRAM_BOT_TOKEN in ("", "YOUR_TELEGRAM_BOT_TOKEN") or TELEGRAM_CHAT_ID in ("", "YOUR_CHAT_ID"):
+        logging.warning("Telegram not configured: skipping send.")
         return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
-        resp = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=12)
-        if resp.status_code != 200:
-            logger.warning("TG send fail: %s %s", resp.status_code, resp.text)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logging.warning(f"TG send fail: {r.status_code} {r.text}")
             return False
         return True
     except Exception as e:
-        logger.warning("TG send exception: %s", e)
+        logging.warning(f"TG send exception: {e}")
         return False
 
-def send_telegram_document_bytes(filename: str, data_bytes: bytes, caption: str = "") -> bool:
-    if not SEND_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.debug("Telegram disabled or not configured.")
-        return False
+# ---------------------------
+# Utils: file storage
+# ---------------------------
+def load_signals():
     try:
-        files = {'document': (filename, io.BytesIO(data_bytes))}
-        data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument", data=data, files=files, timeout=30)
-        return r.status_code == 200
+        with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_signal_record(rec):
+    data = load_signals()
+    data.append(rec)
+    try:
+        os.makedirs(os.path.dirname(SIGNALS_FILE) or ".", exist_ok=True)
+        with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning("TG doc send failed: %s", e)
-        return False
+        logging.warning(f"Backup failed: {e}")
 
 # ---------------------------
-# Exchange helpers
+# Exchange init (MEXC)
 # ---------------------------
-def init_mexc():
+def init_exchange():
     try:
-        params = {"enableRateLimit": True}
-        if MEXC_API_KEY and MEXC_API_SECRET:
-            params.update({"apiKey": MEXC_API_KEY, "secret": MEXC_API_SECRET})
-        ex = ccxt.mexc(params)
-        # some CCXT versions require explicit load_markets
+        ex = ccxt.mexc({
+            "enableRateLimit": True,
+            "apiKey": MEXC_API_KEY,
+            "secret": MEXC_SECRET,
+            # "options": {"defaultType": "future"}  # ccxt mexc futures usage may vary
+        })
         ex.load_markets()
-        logger.info("Connected to MEXC (read-only).")
         return ex
     except Exception as e:
-        logger.error("Failed to init MEXC: %s", e)
+        logging.error(f"Failed to init exchange: {e}")
         return None
 
-def discover_symbols(exchange, suffixs: List[str]=None, limit:int=MONITOR_LIMIT):
-    # Discover markets and filter strictly to Futures USDT.P pairs
+# ---------------------------
+# Helper: get list of USDT.P symbols from MEXC futures
+# ---------------------------
+def discover_usdtp_symbols(ex, limit=SYMBOL_LIMIT, verbose=True):
     try:
-        markets = exchange.load_markets()
+        # Strategy: list markets, pick those ending with 'USDT' or 'USDT.P' and are futures/perpetual
+        markets = ex.load_markets(reload=True)
+        syms = []
+        for s, m in markets.items():
+            # Many exchanges use format "XYZ/USDT" — user wants USDT.P form in messages
+            if "/USDT" in s:
+                # Check if contract / futures by market info if available
+                # We'll allow it and convert to .P in presentation
+                syms.append(s)
+        # sort alphabetical and limit
+        syms = sorted(set(syms))
+        if limit and len(syms) > limit:
+            syms = syms[:limit]
+        if verbose:
+            logging.info(f"Discovered {len(syms)} USDT symbols.")
+        return syms
     except Exception as e:
-        logger.warning("load_markets failed: %s", e)
-        markets = {}
-    out = []
-    for symbol, info in markets.items():
-        su = symbol.upper()
-        # Primary check: suffix match and ensure market appears to be a derivative/future
-        market_type = ""
-        try:
-            market_type = str(info.get("type","")).lower()
-            # some exchanges provide info['info']['contractType'] or similar; we try to be permissive
-        except Exception:
-            market_type = ""
-        # Check suffix and contract/future markers OR explicit ".P" ending
-        is_future_like = False
-        if "future" in market_type or info.get("future", False) or info.get("contract", False):
-            is_future_like = True
-        # Accept only explicit USDT.P endings
-        if su.endswith("USDT.P") and is_future_like:
-            out.append(symbol)
-        # Some market entries may not flag 'future' but still end with USDT.P - include them to be safe
-        elif su.endswith("USDT.P") and not is_future_like:
-            out.append(symbol)
-        if len(out) >= limit:
-            break
-    # Final strict filter (ensure we only keep USDT.P)
-    out = [s for s in out if s.upper().endswith("USDT.P")]
-    logger.info("Discovered %d USDT.P symbols.", len(out))
-    return out
-
-def safe_fetch_ohlcv(exchange, symbol, timeframe="15m", limit=200):
-    try:
-        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except Exception as e:
-        logger.debug("fetch_ohlcv failed %s %s: %s", symbol, timeframe, e)
+        logging.error(f"discover_usdtp_symbols error: {e}")
         return []
 
 # ---------------------------
-# Indicators and heuristics
+# Technical indicators (pandas)
 # ---------------------------
-def ema_series(arr: List[float], period: int):
-    if len(arr) == 0:
-        return np.array([])
-    return pd.Series(arr).ewm(span=period, adjust=False).mean().to_numpy()
+def sma(series, window):
+    return series.rolling(window=window, min_periods=1).mean()
 
-def rsi_from_series(arr: List[float], period: int = 14):
-    a = np.asarray(arr, dtype=float)
-    if a.size < period + 1:
-        return None
-    delta = np.diff(a)
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    up_ewm = pd.Series(up).ewm(alpha=1/period, adjust=False).mean().to_numpy()
-    down_ewm = pd.Series(down).ewm(alpha=1/period, adjust=False).mean().to_numpy()
-    if up_ewm.size == 0 or down_ewm.size == 0:
-        return None
-    rs = up_ewm[-1] / (down_ewm[-1] + 1e-12)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi)
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
-def atr_from_ohlcv(ohlcv: List[List[float]], period=14):
-    highs = np.array([r[2] for r in ohlcv]) if len(ohlcv)>0 else np.array([])
-    lows = np.array([r[3] for r in ohlcv]) if len(ohlcv)>0 else np.array([])
-    closes = np.array([r[4] for r in ohlcv]) if len(ohlcv)>0 else np.array([])
-    if highs.size < 2:
-        return float(np.mean(highs - lows)) if highs.size>0 else 0.0
-    trs = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
-    return float(pd.Series(trs).rolling(period, min_periods=1).mean().iloc[-1]) if len(trs)>0 else float(np.mean(highs - lows)) if highs.size>0 else 0.0
+def rsi(series, length=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(com=length - 1, adjust=False).mean()
+    ma_down = down.ewm(com=length - 1, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-8)
+    return 100 - (100 / (1 + rs))
 
-def detect_reversal_candle(ohlcv: List[List[float]]):
-    if len(ohlcv) < 2:
+# Simple ATR for stop placement/friendliness
+def atr(df, length=14):
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(length, min_periods=1).mean()
+
+# ---------------------------
+# Pattern detectors (simplified)
+# ---------------------------
+def detect_reversal_candle(df):
+    """
+    Detect a clear reversal candle on hourly/4h frames.
+    Simplified: bullish engulfing or large wick opposite side.
+    Return dict with 'type': 'bull'/'bear'/None and 'reason'.
+    """
+    if len(df) < 3:
+        return {"type": None, "reason": "insufficient data"}
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    # bullish engulfing
+    if last['close'] > last['open'] and prev['close'] < prev['open']:
+        if last['close'] > prev['open'] and last['open'] < prev['close']:
+            return {"type": "bull", "reason": "bullish_engulfing"}
+    # bearish engulfing
+    if last['close'] < last['open'] and prev['close'] > prev['open']:
+        if last['close'] < prev['open'] and last['open'] > prev['close']:
+            return {"type": "bear", "reason": "bearish_engulfing"}
+    # large wick detection: tail bigger than body*2
+    body = abs(last['close'] - last['open'])
+    upper_wick = last['high'] - max(last['close'], last['open'])
+    lower_wick = min(last['close'], last['open']) - last['low']
+    if lower_wick > body * 2:
+        return {"type": "bull", "reason": "lower_wick_tail"}
+    if upper_wick > body * 2:
+        return {"type": "bear", "reason": "upper_wick_tail"}
+    return {"type": None, "reason": "no_clear_reversal"}
+
+def detect_fvg(df):
+    """
+    Detect simple Fair Value Gap (FVG) in last 5 candles: gap between high/low of 3 candles pattern.
+    Return True/False and description.
+    """
+    if len(df) < 5:
+        return {"found": False, "desc": "insufficient"}
+    a = df.iloc[-5]
+    b = df.iloc[-4]
+    c = df.iloc[-3]
+    # naive: if a.high < c.low or a.low > c.high (gap)
+    if a['high'] < c['low']:
+        return {"found": True, "desc": "bull_fvg", "level_high": c['low'], "level_low": a['high']}
+    if a['low'] > c['high']:
+        return {"found": True, "desc": "bear_fvg", "level_high": a['low'], "level_low": c['high']}
+    return {"found": False, "desc": "none"}
+
+def detect_order_block(df):
+    """
+    Naive order block detection: find most recent candle with large range vs average.
+    Returns dict or not found.
+    """
+    if len(df) < 10:
+        return {"found": False}
+    ranges = (df['high'] - df['low']).rolling(10).mean()
+    last = df.iloc[-2]  # check previous
+    avg_range = ranges.iloc[-2] if ranges.size > 1 else ranges.iloc[-1]
+    last_range = last['high'] - last['low']
+    if avg_range <= 0:
+        return {"found": False}
+    if last_range > avg_range * 1.8:
+        # treat as potential order block
+        return {"found": True, "side": "bull" if last['close'] > last['open'] else "bear",
+                "level_high": last['high'], "level_low": last['low']}
+    return {"found": False}
+
+def detect_divergence(price_series, ind_series):
+    """
+    Simple divergence: compare last two swings in price and indicator.
+    Returns 'bull', 'bear', or None
+    """
+    if len(price_series) < 6 or len(ind_series) < 6:
         return None
-    o, h, l, c = ohlcv[-1][1], ohlcv[-1][2], ohlcv[-1][3], ohlcv[-1][4]
-    body = abs(c - o)
-    rng = h - l
-    lower_wick = min(c, o) - l
-    upper_wick = h - max(c, o)
-    if rng == 0:
-        return None
-    # doji
-    if body / rng < 0.12:
-        return "doji"
-    # hammer (bullish)
-    if lower_wick > 2 * body and c > o:
-        return "hammer"
-    # shooting star (bearish)
-    if upper_wick > 2 * body and c < o:
-        return "shooting_star"
-    # engulfing simple detection
-    prev_o, prev_c = ohlcv[-2][1], ohlcv[-2][4]
-    if (c > o and prev_c < prev_o and c > prev_o and o < prev_c):
-        return "bull_engulf"
-    if (c < o and prev_c > prev_o and c < prev_o and o > prev_c):
-        return "bear_engulf"
+    # find two recent highs and lows
+    p = price_series
+    i = ind_series
+    # take last 6 points
+    p6 = p[-6:]
+    i6 = i[-6:]
+    # look for bearish divergence: price makes higher high while indicator makes lower high
+    ph1 = max(p6[-6:-3])  # older high
+    ph2 = max(p6[-3:])    # recent high
+    ih1 = max(i6[-6:-3])
+    ih2 = max(i6[-3:])
+    if ph2 > ph1 and ih2 < ih1:
+        return "bear"
+    # bullish divergence: price lower low, ind higher low
+    pl1 = min(p6[-6:-3])
+    pl2 = min(p6[-3:])
+    il1 = min(i6[-6:-3])
+    il2 = min(i6[-3:])
+    if pl2 < pl1 and il2 > il1:
+        return "bull"
     return None
 
-def detect_fvg(ohlcv: List[List[float]], lookback=10):
-    if len(ohlcv) < 3:
-        return False
-    for i in range(-3, -lookback, -1):
-        if abs(i) > len(ohlcv): break
-        a = ohlcv[i-2]; b = ohlcv[i-1]; c = ohlcv[i]
-        # bullish FVG: a.low > c.high
-        try:
-            if a[3] > c[2]:
-                return True
-            if a[2] < c[3]:
-                return True
-        except Exception:
-            continue
-    return False
-
-def detect_order_block(ohlcv: List[List[float]], lookback=30):
-    if len(ohlcv) < 3:
-        return None
-    lookback = min(len(ohlcv)-2, lookback)
-    for i in range(-lookback, -2):
-        big = ohlcv[i]; n1 = ohlcv[i+1]; n2 = ohlcv[i+2]
-        big_body = abs(big[4] - big[1]); rng = big[2] - big[3]
-        if big_body > 0.55 * (rng + 1e-9):
-            # check inside candles
-            if n1[2] <= big[2] and n1[3] >= big[3] and n2[2] <= big[2] and n2[3] >= big[3]:
-                return {"low": min(big[3], n1[3], n2[3]), "high": max(big[2], n1[2], n2[2]), "side": "bull" if big[4] > big[1] else "bear"}
-    return None
-
-def fibonacci_zone_for_entry(ohlcv_short: List[List[float]]):
-    closes = [r[4] for r in ohlcv_short]
-    if len(closes) < 6:
-        return None
-    window = min(len(closes), 60)
-    recent = closes[-window:]
-    high = max(recent); low = min(recent)
-    if high == low:
-        return None
-    return {
-        "0.236": low + (high - low) * 0.236,
-        "0.382": low + (high - low) * 0.382,
-        "0.5": low + (high - low) * 0.5,
-        "0.618": low + (high - low) * 0.618,
-        "0.786": low + (high - low) * 0.786,
-        "high": high, "low": low
-    }
-
 # ---------------------------
-# Scoring (weights sum = 100)
+# Score engine
 # ---------------------------
-WEIGHTS = {
-    "reversal_htf": 20,
-    "divergence": 20,
-    "ema_cross": 15,
-    "rsi": 15,
-    "ob_fvg": 15,
-    "fib_zone": 10,
-    "reentry_candle": 5
-}
-MAX_SCORE = sum(WEIGHTS.values())
-
-def compute_score(checks: Dict[str, bool], fib_ok: bool, reentry: bool):
-    s = 0
-    s += WEIGHTS["reversal_htf"] if checks.get("reversal_htf") else 0
-    s += WEIGHTS["divergence"] if checks.get("divergence") else 0
-    s += WEIGHTS["ema_cross"] if checks.get("ema_cross") else 0
-    s += WEIGHTS["rsi"] if checks.get("rsi") else 0
-    s += WEIGHTS["ob_fvg"] if checks.get("ob_fvg") else 0
-    s += WEIGHTS["fib_zone"] if fib_ok else 0
-    s += WEIGHTS["reentry_candle"] if reentry else 0
-    percent = int(round((s / MAX_SCORE) * 100))
-    return s, percent
-
+def compute_signal_score(context):
+    """
+    context: dict with booleans/values:
+      - mtf_agree_count (0-3)
+      - divergence (None/'bull'/'bear')
+      - reversal_candle (None/'bull'/'bear')
+      - ob_found (bool)
+      - fvg_found (bool)
+      - ema20_over_50 (bool)
+      - rsi_value (float)
+      - price_vs_bos (bool)
+    returns score 0..100 and breakdown
+    """
+    score = 0.0
+    breakdown = []
+    # MTF agreement (4H,1H,15m)
+    score += min(20, context.get("mtf_agree_count", 0) * 8)  # up to 24 but cap later
+    breakdown.append(("mtf", context.get("mtf_agree_count", 0)*8))
+    if context.get("ema20_over_50"):
+        score += 12
+        breakdown.append(("ema20_over_50", 12))
+    if context.get("divergence"):
+        score += 14
+        breakdown.append(("divergence", 14))
+    if context.get("reversal_candle"):
+        score += 10
+        breakdown.append(("reversal_candle", 10))
+    if context.get("ob_found"):
+        score += 10
+        breakdown.append(("ob", 10))
+    if context.get("fvg_found"):
+        score += 8
+        breakdown.append(("fvg", 8))
+    if context.get("price_vs_bos"):
+        score += 8
+        breakdown.append(("bos", 8))
+    # RSI influence
+    rsi = context.get("rsi_value", 50)
+    if rsi is not None:
+        if rsi > 70:
+            score += 6
+            breakdown.append(("rsi>70", 6))
+        elif rsi > 60:
+            score += 4
+            breakdown.append(("rsi>60", 4))
+        elif rsi < 30:
+            score += 6
+            breakdown.append(("rsi<30", 6))
+    # normalize and cap
+    if score > 100:
+        score = 100.0
+    if score < 0:
+        score = 0.0
+    return round(score, 1), breakdown
+ # ---------------------------
+# Market Analyzer
 # ---------------------------
-# Format signal message
-# ---------------------------
-def format_signal_message(sig: Dict[str, Any]):
-    header = "🟢" if sig["kind"] == "CONFIRMED" else ("🟡" if sig["kind"] == "NEAR" else "🔵")
-    lines = [
-        f"{header} {sig['kind']} — {sig['symbol']}",
-        f"SIDE: {sig['side']}  ENTRY: {sig['entry']}",
-        f"SL: {sig['sl']}  TP1: {sig['tp1']}  TP2: {sig['tp2']}",
-        f"RSI(15m): {sig.get('rsi15',0):.2f} | LEVERAGE: {sig.get('leverage', LEVERAGE_DEFAULT)}x",
-        f"Score: {sig.get('score_percent',0)}% | Notes: {sig.get('notes','')}",
-        f"Time: {sig.get('time', datetime.utcnow().isoformat())} UTC",
-        "",
-        "⚠️ This is analysis only — no automatic orders. Verify liquidity/slippage before manual execution."
-    ]
-    return "\n".join(lines)
-
-# ---------------------------
-# Persistence
-# ---------------------------
-def ensure_files():
-    if not os.path.exists(SIGNALS_FILE):
-        with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f)
-    if not os.path.exists(REPORTS_DIR):
-        os.makedirs(REPORTS_DIR, exist_ok=True)
-
-def append_signal(rec: Dict[str, Any]):
+def analyze_symbol(ex, symbol):
+    """
+    التحليل الأساسي لزوج واحد: بيقرأ بيانات الفريمات المختلفة، ويدمج إشارات ICT/SMC/RSI/FVG/Divergence.
+    """
     try:
-        with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-            arr = json.load(f)
-    except Exception:
-        arr = []
-    arr.append(rec)
-    arr = arr[-20000:]
-    with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-        json.dump(arr, f, ensure_ascii=False, indent=2)
+        # get OHLCV for 15m, 1h, 4h
+        tf_data = {}
+        for tf in ["15m", "1h", "4h"]:
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=150)
+            df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
+            tf_data[tf] = df
+
+        # get signals per timeframe
+        tf_signals = {}
+        for tf, df in tf_data.items():
+            df["ema20"] = ema(df["close"], 20)
+            df["ema50"] = ema(df["close"], 50)
+            df["rsi"] = rsi(df["close"], 14)
+            tf_signals[tf] = {
+                "trend_up": df["ema20"].iloc[-1] > df["ema50"].iloc[-1],
+                "rsi": df["rsi"].iloc[-1],
+                "divergence": detect_divergence(df["close"], df["rsi"]),
+                "reversal": detect_reversal_candle(df),
+                "fvg": detect_fvg(df),
+                "ob": detect_order_block(df)
+            }
+
+        # توافق الفريمات
+        mtf_agree_count = sum([1 if s["trend_up"] else 0 for s in tf_signals.values()])
+        mtf_dir = "bull" if mtf_agree_count >= 2 else "bear"
+
+        # آخر فريم 15m هو المرجع للدخول
+        df = tf_data["15m"]
+        rsi15 = tf_signals["15m"]["rsi"]
+        div = tf_signals["1h"]["divergence"] or tf_signals["4h"]["divergence"]
+        rev = tf_signals["1h"]["reversal"]
+        fvg = tf_signals["1h"]["fvg"]
+        ob = tf_signals["4h"]["ob"]
+
+        # إعداد البيانات للتحليل النهائي
+        context = {
+            "mtf_agree_count": mtf_agree_count,
+            "ema20_over_50": tf_signals["15m"]["trend_up"],
+            "divergence": div,
+            "reversal_candle": rev["type"] if rev else None,
+            "ob_found": ob["found"],
+            "fvg_found": fvg["found"],
+            "rsi_value": rsi15,
+            "price_vs_bos": True
+        }
+        score, breakdown = compute_signal_score(context)
+
+        # تحديد الاتجاه المقترح
+        direction = "LONG" if mtf_dir == "bull" else "SHORT"
+
+        # حساب مناطق الدخول والأهداف
+        entry = df["close"].iloc[-1]
+        atr_val = atr(df).iloc[-1]
+        if direction == "LONG":
+            sl = df["low"].iloc[-1]
+            tp1 = entry + atr_val * 1.5
+            tp2 = entry + atr_val * 2.5
+        else:
+            sl = df["high"].iloc[-1]
+            tp1 = entry - atr_val * 1.5
+            tp2 = entry - atr_val * 2.5
+
+        # تحديد نوع الإشارة
+        if score >= CONFIRMED_SCORE:
+            kind = "CONFIRMED"
+        elif score >= NEAR_SCORE:
+            kind = "NEAR"
+        else:
+            kind = "PRE"
+
+        # تجهيز الملاحظات
+        note_items = []
+        if context["divergence"]: note_items.append("Divergence")
+        if context["ob_found"]: note_items.append("OB")
+        if context["fvg_found"]: note_items.append("FVG")
+        if context["reversal_candle"]: note_items.append("Reversal")
+        if mtf_agree_count >= 2: note_items.append("MTF aligned")
+        notes = ", ".join(note_items) if note_items else "No major confluence"
+
+        result = {
+            "symbol": symbol,
+            "side": direction,
+            "entry": round(entry,6),
+            "sl": round(sl,6),
+            "tp1": round(tp1,6),
+            "tp2": round(tp2,6),
+            "rsi": round(rsi15,2),
+            "score": score,
+            "kind": kind,
+            "notes": notes,
+            "time": datetime.now(timezone.utc).isoformat()
+        }
+        return result
+    except Exception as e:
+        logging.warning(f"analyze_symbol failed {symbol}: {e}")
+        return None
+
 
 # ---------------------------
-# 6H report helpers
+# Cycle Runner
 # ---------------------------
-def check_signal_status_by_fetch(ex, rec):
+def run_cycle(ex):
+    syms = discover_usdtp_symbols(ex, limit=SYMBOL_LIMIT)
+    if not syms:
+        logging.info("No symbols found.")
+        return
+
+    results = []
+    sent_count = 0
+    long_signals = 0
+    short_signals = 0
+    confirmed_signals = 0
+    near_signals = 0
+
+    for s in syms:
+        if sent_count >= MAX_SENT_PER_CYCLE:
+            break
+        res = analyze_symbol(ex, s)
+        if not res: continue
+        results.append(res)
+
+        if res["side"] == "LONG": long_signals += 1
+        if res["side"] == "SHORT": short_signals += 1
+        if res["kind"] == "CONFIRMED": confirmed_signals += 1
+        if res["kind"] == "NEAR": near_signals += 1
+
+        # إرسال الإشارة القوية فقط
+        if res["kind"] in ("CONFIRMED", "NEAR"):
+            msg = (
+                f"{'🟢' if res['side']=='LONG' else '🔴'} {res['kind']} — {res['symbol'].replace('/USDT','/USDT.P')}\n"
+                f"SIDE: {res['side']}  ENTRY: {res['entry']}\n"
+                f"SL: {res['sl']}  TP1: {res['tp1']}  TP2: {res['tp2']}\n"
+                f"RSI(15m): {res['rsi']} | SCORE: {res['score']}%\n"
+                f"Notes: {res['notes']}\n"
+                "⚠️ Analysis only — no automatic orders. Verify liquidity/slippage before manual execution."
+            )
+            send_telegram_text(msg)
+            save_signal_record(res)
+            sent_count += 1
+
+    # ملخص الدورة
+    summary = (
+        f"📊 Cycle done — Total: {len(results)} | Sent: {sent_count} | Confirmed: {confirmed_signals} | "
+        f"Near: {near_signals} | Longs: {long_signals} | Shorts: {short_signals}"
+    )
+    logging.info(summary)
+    send_telegram_text(summary)
+ # === Part 3 of 3 ===
+# ---------------------------
+# Market Condition & Reports
+# ---------------------------
+
+def compute_market_condition(ex, symbols, sample_size=60):
+    """
+    Analyze a sample of symbols and return short/medium/long bias.
+    short: 15m, medium: 1h, long: 4h
+    Returns dict with counts and final bias.
+    """
     try:
-        since = int(dateparser.parse(rec["time"]).timestamp() * 1000)
-        ohl = ex.fetch_ohlcv(rec["symbol"], timeframe="15m", since=since, limit=500)
-    except Exception:
-        ohl = safe_fetch_ohlcv(ex, rec["symbol"], timeframe="15m", limit=200)
-    highs = [r[2] for r in ohl]
-    lows = [r[3] for r in ohl]
-    side = rec["side"]
-    tp1, tp2, sl = rec["tp1"], rec["tp2"], rec["sl"]
-    if side == "LONG":
-        if any(h >= tp2 for h in highs): return {"status":"TP2","hit_price":tp2}
-        if any(h >= tp1 for h in highs): return {"status":"TP1","hit_price":tp1}
-        if any(l <= sl for l in lows): return {"status":"SL","hit_price":sl}
-    else:
-        if any(l <= tp2 for l in lows): return {"status":"TP2","hit_price":tp2}
-        if any(l <= tp1 for l in lows): return {"status":"TP1","hit_price":tp1}
-        if any(h >= sl for h in highs): return {"status":"SL","hit_price":sl}
-    return {"status":"OPEN","hit_price":None}
+        sample = symbols[:min(len(symbols), sample_size)]
+        counts = {"short": {"bull":0,"bear":0,"neutral":0},
+                  "medium": {"bull":0,"bear":0,"neutral":0},
+                  "long": {"bull":0,"bear":0,"neutral":0}}
+        for s in sample:
+            try:
+                df15 = fetch_ohlcv(ex, s, timeframe="15m", limit=100)
+                df1 = fetch_ohlcv(ex, s, timeframe="1h", limit=100)
+                df4 = fetch_ohlcv(ex, s, timeframe="4h", limit=100)
+                def bias(df):
+                    if df is None or df.empty or len(df) < 20:
+                        return "neutral"
+                    ema20 = ema(df['close'], 20).iloc[-1]
+                    ema50 = ema(df['close'], 50).iloc[-1]
+                    if ema20 > ema50: return "bull"
+                    if ema20 < ema50: return "bear"
+                    return "neutral"
+                counts["short"][bias(df15)] += 1
+                counts["medium"][bias(df1)] += 1
+                counts["long"][bias(df4)] += 1
+            except Exception:
+                continue
+        def decide(c):
+            total = c["bull"] + c["bear"] + c["neutral"]
+            if total == 0: return "neutral"
+            if c["bull"] > c["bear"] and c["bull"]/total > 0.55: return "bull"
+            if c["bear"] > c["bull"] and c["bear"]/total > 0.55: return "bear"
+            return "neutral"
+        res = {
+            "short": decide(counts["short"]),
+            "medium": decide(counts["medium"]),
+            "long": decide(counts["long"]),
+            "counts": counts
+        }
+        return res
+    except Exception as e:
+        logging.warning(f"compute_market_condition failed: {e}")
+        return {"short":"neutral","medium":"neutral","long":"neutral","counts":{}}
 
-def build_and_send_6h_report(ex):
+def send_market_condition(ex, symbols):
+    mc = compute_market_condition(ex, symbols, sample_size=SYMBOL_LIMIT)
+    text = (
+        f"📊 Market Condition\n"
+        f"Short (15m): {mc['short']}\n"
+        f"Medium (1h): {mc['medium']}\n"
+        f"Long (4h): {mc['long']}\n"
+        f"\n_Details: bull={mc['counts'].get('short',{}).get('bull',0)} (short), "
+        f"{mc['counts'].get('medium',{}).get('bull',0)} (med), {mc['counts'].get('long',{}).get('bull',0)} (long)_"
+    )
+    send_telegram_text(text)
+    return mc
+
+# ---------------------------
+# Helpers: fetch_ohlcv wrapper used earlier in Part 2 but not defined there
+# ---------------------------
+def fetch_ohlcv(ex, symbol, timeframe="15m", limit=200):
+    """
+    Safe fetch wrapper: returns pandas DataFrame with columns open/high/low/close/volume
+    """
+    try:
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not ohlcv:
+            return pd.DataFrame()
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df.set_index("dt", inplace=True)
+        # ensure numeric types
+        df = df[["open","high","low","close","volume"]].astype(float)
+        return df
+    except Exception as e:
+        logging.debug(f"fetch_ohlcv failed {symbol} {timeframe}: {e}")
+        return pd.DataFrame()
+
+# ---------------------------
+# 6-hour & daily scheduled report (improved)
+# ---------------------------
+def build_and_send_6h_report():
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
     since = now - timedelta(hours=6)
     try:
-        with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-            arr = json.load(f)
+        signals = load_signals()
     except Exception:
-        arr = []
-    window = [r for r in arr if dateparser.parse(r["time"]).replace(tzinfo=timezone.utc) > since]
+        signals = []
+    window = [r for r in signals if datetime.fromisoformat(r.get("time", now.isoformat())).replace(tzinfo=timezone.utc) > since]
     if not window:
-        logger.info("No signals in last 6h.")
+        logging.info("6h report: no signals")
         return
-    lines = [f"📈 WSS 6H Report — {since.strftime('%Y-%m-%d %H:%M')} → {now.strftime('%Y-%m-%d %H:%M')} UTC"]
-    counts = {"TP2":0,"TP1":0,"SL":0,"OPEN":0,"UNKNOWN":0}
-    for i, rec in enumerate(window, start=1):
-        st = check_signal_status_by_fetch(ex, rec)
-        counts[st["status"]] = counts.get(st["status"],0) + 1
-        icon = {"TP2":"✅ TP2","TP1":"🟡 TP1","SL":"🔴 SL","OPEN":"⚪ OPEN","UNKNOWN":"❓"}[st["status"]]
-        lines.append(f"{i}) {rec['symbol']} — {rec['side']} | {icon} | entry:{rec['entry']}")
+    entries = []
+    counts = {"CONFIRMED":0,"NEAR":0,"PRE":0}
+    for s in window:
+        counts[s.get("kind","PRE")] = counts.get(s.get("kind","PRE"),0) + 1
+        entries.append(s)
+    # build message
+    header = f"📈 6H Report — {since.strftime('%Y-%m-%d %H:%M')} → {now.strftime('%Y-%m-%d %H:%M')} UTC\n"
+    lines = [header]
+    for i,e in enumerate(entries, start=1):
+        lines.append(f"{i}) {e.get('symbol')} | {e.get('kind')} | {e.get('side')} | Sent: {e.get('time')}")
+        lines.append(f"    Entry: {e.get('entry')} | SL: {e.get('sl')} | TP1: {e.get('tp1')} | TP2: {e.get('tp2')}")
     lines.append("")
-    lines.append(f"Summary — TP2:{counts['TP2']} | TP1:{counts['TP1']} | SL:{counts['SL']} | OPEN:{counts['OPEN']}")
+    lines.append(f"Counts — CONFIRMED:{counts['CONFIRMED']} | NEAR:{counts['NEAR']} | PRE:{counts['PRE']}")
     send_telegram_text("\n".join(lines))
-    fn = f"{REPORTS_DIR}/report_{now.strftime('%Y-%m-%d_%H%MUTC')}.json"
-    with open(fn, "w", encoding="utf-8") as f:
-        json.dump({"start":since.isoformat(),"end":now.isoformat(),"entries":window,"counts":counts}, f, ensure_ascii=False, indent=2)
-    logger.info("Saved 6H report %s", fn)
+    # save json
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        fname = os.path.join(REPORTS_DIR, f"report_6h_{now.strftime('%Y-%m-%d_%H%M')}.json")
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump({"start":since.isoformat(),"end":now.isoformat(),"entries":entries,"counts":counts}, f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved 6h report to {fname}")
+    except Exception as e:
+        logging.warning(f"Saving 6h report failed: {e}")
+
+def build_and_send_daily_report():
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    since = now - timedelta(days=1)
+    try:
+        signals = load_signals()
+    except Exception:
+        signals = []
+    window = [r for r in signals if datetime.fromisoformat(r.get("time", now.isoformat())).replace(tzinfo=timezone.utc) > since]
+    total = len(window)
+    by_kind = {}
+    for r in window:
+        k = r.get("kind","PRE")
+        by_kind[k] = by_kind.get(k,0) + 1
+    text = f"📅 Daily Report — {now.strftime('%Y-%m-%d')}\nTotal signals last 24h: {total}\n" + \
+           "\n".join([f"{k}: {v}" for k,v in by_kind.items()])
+    send_telegram_text(text)
+    # save
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        fname = os.path.join(REPORTS_DIR, f"daily_{now.strftime('%Y-%m-%d')}.json")
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump({"date":now.strftime('%Y-%m-%d'), "entries":window, "by_kind":by_kind}, f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved daily report to {fname}")
+    except Exception as e:
+        logging.warning(f"Saving daily report failed: {e}")
 
 # ---------------------------
-# Core strategy (HTF then LTF)
+# Main runner with scheduling
 # ---------------------------
-def evaluate_symbol_strategy(ex, symbol) -> Dict[str,Any]:
-    # HTF: 4h/1h for reversal + divergence
-    o4h = safe_fetch_ohlcv(ex, symbol, timeframe="4h", limit=120)
-    o1h = safe_fetch_ohlcv(ex, symbol, timeframe="1h", limit=160)
-    if not o4h or not o1h:
-        return None
-    closes4h = [r[4] for r in o4h]; closes1h = [r[4] for r in o1h]
-    rsi4h = rsi_from_series(closes4h, period=14)
-    rsi1h = rsi_from_series(closes1h, period=14)
-    rev4h = detect_reversal_candle(o4h)
-    rev1h = detect_reversal_candle(o1h)
-    # detect divergence simple
-    def detect_div(ohl, rsi_series):
-        try:
-            return detect_divergence_price_vs_rsi(ohl, rsi_series)
-        except Exception:
-            return None
-    div4h = None
-    div1h = None
-    # Build rsi series for detection functions (incremental)
-    try:
-        rsi_series_4h = []
-        for i in range(len(closes4h)):
-            sub = closes4h[:i+1]
-            rsi_series_4h.append(rsi_from_series(sub,14) or 0)
-        div4h = detect_divergence_price_vs_rsi(o4h, rsi_series_4h)
-    except Exception:
-        div4h = None
-    try:
-        rsi_series_1h = []
-        for i in range(len(closes1h)):
-            sub = closes1h[:i+1]
-            rsi_series_1h.append(rsi_from_series(sub,14) or 0)
-        div1h = detect_divergence_price_vs_rsi(o1h, rsi_series_1h)
-    except Exception:
-        div1h = None
 
-    htf_ok = False; side_htf = None; htf_notes=[]
-    if rev4h and div4h:
-        htf_ok = True; side_htf = "LONG" if div4h=="bullish" else "SHORT"; htf_notes.append("4H_rev+div")
-    elif rev1h and div1h:
-        htf_ok = True; side_htf = "LONG" if div1h=="bullish" else "SHORT"; htf_notes.append("1H_rev+div")
-    else:
-        if rev4h:
-            htf_ok = True; side_htf = "LONG" if o4h[-1][4] > o4h[-1][1] else "SHORT"; htf_notes.append("4H_rev")
-        elif rev1h:
-            htf_ok = True; side_htf = "LONG" if o1h[-1][4] > o1h[-1][1] else "SHORT"; htf_notes.append("1H_rev")
-    if not htf_ok:
-        return None
-
-    # LTF confirmations (30m / 15m)
-    o30 = safe_fetch_ohlcv(ex, symbol, timeframe="30m", limit=200)
-    o15 = safe_fetch_ohlcv(ex, symbol, timeframe="15m", limit=200)
-    if not o15 or not o30:
-        return None
-    closes15 = [r[4] for r in o15]
-    closes30 = [r[4] for r in o30]
-    ema20_15 = ema_series(closes15, 20); ema50_15 = ema_series(closes15, 50)
-    ema20_30 = ema_series(closes30, 20); ema50_30 = ema_series(closes30, 50)
-    rsi15 = rsi_from_series(closes15, period=15) or 50.0
-    ema_dir_15 = (ema20_15[-1] > ema50_15[-1]) if len(ema20_15)>0 and len(ema50_15)>0 else False
-    ema_dir_1h = None
-    try:
-        closes1h_short = [r[4] for r in o1h] if o1h else []
-        ema20_1h = ema_series(closes1h_short,20) if len(closes1h_short)>0 else np.array([])
-        ema50_1h = ema_series(closes1h_short,50) if len(closes1h_short)>0 else np.array([])
-        ema_dir_1h = (ema20_1h[-1] > ema50_1h[-1]) if len(ema20_1h)>0 and len(ema50_1h)>0 else False
-    except Exception:
-        ema_dir_1h = False
-
-    # OB / FVG
-    ob_1h = detect_order_block(o1h)
-    fvg_30 = detect_fvg(o30)
-    # Fibonacci entry on 30m
-    fib = fibonacci_zone_for_entry(o30)
-    fib_ok = False; entry_zone = None
-    last = float(closes15[-1])
-    if fib:
-        entry_low = fib["0.5"]; entry_high = fib["0.618"]
-        if min(entry_low, entry_high) <= last <= max(entry_low, entry_high):
-            fib_ok = True
-            entry_zone = (entry_low, entry_high)
-    # re-entry candle on 15m
-    reentry = detect_reversal_candle(o15)
-    # trend break check on 4h
-    trend_break = False
-    try:
-        closes4h_arr = [r[4] for r in o4h[-12:]]
-        last4 = closes4h_arr[-1]
-        if last4 > max(closes4h_arr[:-1]) * 1.0005 or last4 < min(closes4h_arr[:-1]) * 0.9995:
-            trend_break = True
-    except Exception:
-        trend_break = False
-
-    # checks map for scoring
-    checks = {
-        "reversal_htf": bool(rev4h or rev1h),
-        "divergence": bool(div4h or div1h),
-        "ema_cross": bool(ema_dir_15 and ((side_htf=="LONG" and ema_dir_15) or (side_htf=="SHORT" and not ema_dir_15))),
-        "rsi": bool((side_htf=="LONG" and rsi15>50) or (side_htf=="SHORT" and rsi15<50)),
-        "ob_fvg": bool((ob_1h and ((side_htf=="LONG" and ob_1h["side"]=="bull") or (side_htf=="SHORT" and ob_1h["side"]=="bear"))) or fvg_30)
-    }
-
-    raw_score, score_percent = compute_score(checks, fib_ok, bool(reentry))
-    if score_percent >= CONFIRMED_THRESHOLD:
-        kind = "CONFIRMED"
-    elif score_percent >= NEAR_THRESHOLD:
-        kind = "NEAR"
-    else:
-        kind = "PRE"
-
-    # build entry, SL (tail of HTF reversal), TP (ATR based)
-    last_price = float(closes15[-1])
-    tail_price = None
-    if rev4h:
-        tail_price = o4h[-1][3] if side_htf=="LONG" else o4h[-1][2]
-    elif rev1h:
-        tail_price = o1h[-1][3] if side_htf=="LONG" else o1h[-1][2]
-    else:
-        tail_price = last_price * (0.995 if side_htf=="LONG" else 1.005)
-    sl = float(tail_price)
-    atr = atr_from_ohlcv(o1h if o1h else o30)
-    if side_htf == "LONG":
-        tp1 = float(last_price + atr * 1.5)
-        tp2 = float(last_price + atr * 3.0)
-    else:
-        tp1 = float(last_price - atr * 1.5)
-        tp2 = float(last_price - atr * 3.0)
-
-    notes = []
-    notes.extend(htf_notes)
-    if checks["ema_cross"]: notes.append("EMA20/50 LTF")
-    if checks["rsi"]: notes.append(f"RSI15={rsi15:.2f}")
-    if checks["ob_fvg"]: notes.append("OB/FVG")
-    if fib_ok: notes.append("FIB 0.5-0.618")
-    if reentry: notes.append("Re-entry candle")
-    if trend_break: notes.append("BOS")
-
-    signal = {
-        "time": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
-        "symbol": symbol,
-        "side": side_htf,
-        "kind": kind,
-        "entry": float(round(last_price, 12)),
-        "sl": float(round(sl, 12)),
-        "tp1": float(round(tp1, 12)),
-        "tp2": float(round(tp2, 12)),
-        "score_raw": raw_score,
-        "score_percent": score_percent,
-        "rsi15": float(round(rsi15,2)),
-        "notes": ", ".join(notes),
-        "leverage": LEVERAGE_DEFAULT
-    }
-    return signal
-
-# ---------------------------
-# Main loop
-# ---------------------------
-def main():
-    ensure_files()
-    ex = init_mexc()
-    if ex is None:
-        logger.error("Exchange init failed, exiting.")
+def main_loop():
+    ex = init_exchange()
+    if not ex:
+        logging.error("Exchange init failed. Exiting.")
+        return
+    # get symbols once at start
+    symbols = discover_usdtp_symbols(ex, limit=SYMBOL_LIMIT)
+    if not symbols:
+        logging.warning("No symbols discovered - exiting.")
         return
 
-    symbols = discover_symbols(ex, suffixs=["USDT.P"], limit=MONITOR_LIMIT)
-    if not symbols:
-        env_list = os.getenv("SYMBOLS", "")
-        symbols = [s.strip() for s in env_list.split(",") if s.strip()] or ["SEDA/USDT.P","AO/USDT.P","GPS/USDT.P"]
-    logger.info("Monitoring %d USDT.P symbols (limit %d). CONFIRMED ≥ %d%%", len(symbols), MONITOR_LIMIT, CONFIRMED_THRESHOLD)
-    send_telegram_text(f"🚀 WSS v2.6 started — monitoring {min(len(symbols), MONITOR_LIMIT)} USDT.P symbols. CONFIRMED ≥ {CONFIRMED_THRESHOLD}%")
+    # initial heartbeat
+    send_telegram_text(f"✅ WSS vAdvanced started. Monitoring {len(symbols)} symbols. Cycle interval: {SCAN_INTERVAL}s")
 
-    cycle = 0
-    next_6h = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=6)
+    # schedule next 6h by rounding to nearest multiple
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    next_6h = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    while next_6h.hour % SUMMARY_INTERVAL_HOURS != 0:
+        next_6h += timedelta(hours=1)
+    # schedule daily at 00:00 UTC
+    next_daily = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+    cycle_index = 0
     while True:
-        cycle += 1
-        start = datetime.utcnow()
-        logger.info("Cycle #%d start: scanning %d symbols", cycle, min(len(symbols), MONITOR_LIMIT))
-        found_signals = []
-        sent_signals = 0
-        scanned = 0
-
-        # stats this cycle
-        count_long = 0
-        count_short = 0
-        confirmed = 0
-        near = 0
-        pre = 0
-
-        for sym in symbols[:MONITOR_LIMIT]:
-            scanned += 1
-            try:
-                sig = evaluate_symbol_strategy(ex, sym)
-                if sig:
-                    append_signal(sig)
-                    found_signals.append(sig)
-                    # stats
-                    if sig["side"] == "LONG":
-                        count_long += 1
-                    elif sig["side"] == "SHORT":
-                        count_short += 1
-                    if sig["kind"] == "CONFIRMED":
-                        confirmed += 1
-                    elif sig["kind"] == "NEAR":
-                        near += 1
-                    else:
-                        pre += 1
-                    # send confirmed/near
-                    if sig["kind"] in ("CONFIRMED","NEAR"):
-                        msg = format_signal_message(sig)
-                        ok = send_telegram_text(msg)
-                        if not ok:
-                            logger.warning("Failed to send TG for %s", sym)
-                        else:
-                            sent_signals += 1
-                sleep(REQUEST_DELAY_MS / 1000.0)
-            except Exception as e:
-                logger.debug("Symbol %s analysis failed: %s", sym, traceback.format_exc(limit=1))
-            # early stop not used here; scan full list up to limit
-
-        duration = (datetime.utcnow() - start).seconds
-        total = count_long + count_short
-        long_pct = round((count_long / total) * 100, 1) if total else 0
-        short_pct = round((count_short / total) * 100, 1) if total else 0
-
-        logger.info("Cycle #%d done — Scanned:%d | Found:%d | Sent:%d | Duration:%ds", cycle, scanned, len(found_signals), sent_signals, duration)
-
-        # send summary
-        summary_msg = (
-            f"📊 Cycle #{cycle} Summary:\n"
-            f"• Long signals: {count_long}\n"
-            f"• Short signals: {count_short}\n"
-            f"• CONFIRMED: {confirmed}\n"
-            f"• NEAR: {near}\n"
-            f"• PRE: {pre}\n"
-            f"• Total Sent: {sent_signals}\n"
-            f"• Direction Ratio: LONG {long_pct}% / SHORT {short_pct}%\n"
-            f"• Duration: {duration}s"
-        )
-        send_telegram_text(summary_msg)
-
-        # save 6h report if time
-        if datetime.utcnow().replace(tzinfo=timezone.utc) >= next_6h:
-            try:
-                build_and_send_6h_report(ex)
-            except Exception as e:
-                logger.warning("6H report failed: %s", e)
-            next_6h += timedelta(hours=6)
-
-        # heartbeat occasionally
-        if cycle % 12 == 0:
-            send_telegram_text(f"[Heartbeat] Bot alive — next summary at { (datetime.utcnow()+timedelta(seconds=CYCLE_SECONDS)).strftime('%H:%M:%S UTC') }")
-
-        sleep_seconds = max(0, CYCLE_SECONDS - duration)
-        logger.info("Sleeping %d seconds until next cycle", sleep_seconds)
-        time.sleep(sleep_seconds)
+        try:
+            cycle_index += 1
+            logging.info(f"Starting cycle #{cycle_index}")
+            # refresh symbols every 6 cycles to catch new pairs
+            if cycle_index % 6 == 1:
+                symbols = discover_usdtp_symbols(ex, limit=SYMBOL_LIMIT)
+            # run cycle scan
+            run_cycle(ex)
+            # check 6h schedule
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            if now >= next_6h:
+                logging.info("Running scheduled 6h report.")
+                build_and_send_6h_report()
+                next_6h += timedelta(hours=SUMMARY_INTERVAL_HOURS)
+            if now >= next_daily:
+                logging.info("Running scheduled daily report.")
+                build_and_send_daily_report()
+                next_daily += timedelta(days=1)
+            # sleep until next cycle
+            logging.info(f"Cycle #{cycle_index} done. Sleeping for {SCAN_INTERVAL} seconds.")
+            time.sleep(SCAN_INTERVAL)
+        except Exception as e:
+            logging.error(f"Main loop error: {e}\n{traceback.format_exc()}")
+            # small sleep then continue
+            time.sleep(10)
 
 # ---------------------------
-# Entry
+# Small utilities re-exported for previous parts compatibility
+# ---------------------------
+# ensure functions used earlier are visible in this scope (some are defined above)
+# (fetch_ohlcv, send_telegram_text, save_signal_record, load_signals, etc.)
+
+# ---------------------------
+# Entrypoint
 # ---------------------------
 if __name__ == "__main__":
     try:
-        ensure_files()
-        main()
+        main_loop()
     except KeyboardInterrupt:
-        logger.info("Stopped by user.")
-    except Exception:
-        logger.exception("Fatal error:")
+        logging.info("Interrupted by user. Exiting.")
+    except Exception as e:
+        logging.error(f"Fatal error: {e}\n{traceback.format_exc()}")
+
+# === End of Part 3 ===
