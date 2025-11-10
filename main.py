@@ -8,19 +8,20 @@ import numpy as np
 from datetime import datetime, timezone
 from flask import Flask
 import telebot
-import ta  # مكتبة التحليل الفني
+import ta
 
 # =========================================================
 # إعدادات عامة
 # =========================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-MEXC_API_URL = "https://contract.mexc.com/api/v1/contract/symbols"
+# مفاتيح API
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
+MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-RISK_USD = float(os.getenv("RISK_USD", "10.0"))
-CONFIRMATION_THRESHOLD = 0.85
 
+CONFIRMATION_THRESHOLD = 0.85
 bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
 # =========================================================
@@ -30,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "✅ WSS Advanced Web Bot is running successfully!"
+    return "✅ WSS Hybrid Analysis Bot (MEXC + Binance) is running successfully!"
 
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
@@ -51,7 +52,7 @@ def calculate_indicators(df):
 def detect_reversal_candle(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    # شمعة انعكاسية بسيطة (Hammer / Shooting Star)
+    # شمعة انعكاسية بسيطة
     if last["close"] > last["open"] and (last["low"] < prev["low"]) and (last["high"] < prev["high"]):
         return "bullish"
     elif last["close"] < last["open"] and (last["high"] > prev["high"]) and (last["low"] > prev["low"]):
@@ -59,15 +60,42 @@ def detect_reversal_candle(df):
     return None
 
 # =========================================================
-# تحليل زوج عملات واحد
+# جلب بيانات MEXC أو Binance
 # =========================================================
-def analyze_symbol(symbol):
+def fetch_symbols():
+    """يحاول يجلب الأزواج من MEXC أولًا، وإن فشل ينتقل إلى Binance"""
     try:
-        klines = requests.get(f"https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval=1h&limit=200", timeout=12).json()
-        if "data" not in klines or len(klines["data"]) < 50:
-            return None
-        
-        df = pd.DataFrame(klines["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get("https://contract.mexc.com/api/v1/contract/symbols", headers=headers, timeout=8).json()
+        symbols = [s["symbol"] for s in res["data"] if s["quoteCoin"] == "USDT" and s["state"] == "ENABLED"]
+        logging.info(f"✅ MEXC symbols fetched: {len(symbols)}")
+        return symbols, "MEXC"
+    except Exception as e:
+        logging.warning(f"MEXC fetch failed: {e}. Trying Binance fallback...")
+        try:
+            res = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=8).json()
+            symbols = [s["symbol"] for s in res["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+            logging.info(f"✅ Binance fallback: {len(symbols)} symbols")
+            return symbols, "Binance"
+        except Exception as e2:
+            logging.error(f"Both MEXC and Binance failed: {e2}")
+            return [], "None"
+
+# =========================================================
+# تحليل زوج واحد
+# =========================================================
+def analyze_symbol(symbol, source):
+    try:
+        if source == "MEXC":
+            url = f"https://contract.mexc.com/api/v1/contract/kline/{symbol}?interval=1h&limit=200"
+            data = requests.get(url, timeout=8).json()["data"]
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        else:
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1h&limit=200"
+            data = requests.get(url, timeout=8).json()
+            df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume",
+                                             "_", "__", "___", "____", "_____", "______"])
+
         df["open"] = df["open"].astype(float)
         df["high"] = df["high"].astype(float)
         df["low"] = df["low"].astype(float)
@@ -106,61 +134,57 @@ def analyze_symbol(symbol):
             }
         return None
     except Exception as e:
-        logging.warning(f"{symbol} failed: {e}")
+        logging.warning(f"{symbol} analysis failed: {e}")
         return None
 
 # =========================================================
-# دالة لإرسال رسالة للتليجرام
+# تليجرام
 # =========================================================
-def send_telegram(message):
+def send_telegram(msg):
     if bot:
         try:
-            bot.send_message(TELEGRAM_CHAT_ID, message, parse_mode="Markdown")
+            bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         except Exception as e:
             logging.error(f"Telegram error: {e}")
 
 # =========================================================
-# الدورة الأساسية للتحليل
+# الدورة الكاملة
 # =========================================================
-def analysis_cycle():
-    try:
-        res = requests.get(MEXC_API_URL, timeout=12).json()
-        symbols = [s["symbol"] for s in res["data"] if s["quoteCoin"] == "USDT" and s["state"] == "ENABLED"]
-        logging.info(f"🔍 Found {len(symbols)} tradable USDT pairs.")
-    except Exception as e:
-        logging.error(f"MEXC fetch error: {e}")
-        symbols = []
+def run_analysis():
+    symbols, source = fetch_symbols()
+    if not symbols:
+        send_telegram("❌ Failed to fetch symbols from both MEXC and Binance.")
+        return
 
     confirmed = []
     for sym in symbols[:60]:
-        sig = analyze_symbol(sym)
+        sig = analyze_symbol(sym, source)
         if sig:
             confirmed.append(sig)
             send_telegram(f"""
-🟢 CONFIRMED — {sym}
+🟢 CONFIRMED — {sig['symbol']} ({source})
 SIDE: {sig['side']}
 ENTRY: {sig['entry']:.6f}
 SL: {sig['sl']:.6f}
 TP1: {sig['tp1']:.6f}
 TP2: {sig['tp2']:.6f}
 Score: {sig['score']*100:.0f}%
-⚠️ *Analysis only — no auto-trading.*
+⚠️ Analysis only — no automatic orders.
             """)
 
-    send_telegram(f"📊 Cycle done — Confirmed: {len(confirmed)} | Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
-    logging.info(f"Cycle done — Confirmed {len(confirmed)} symbols.")
+    send_telegram(f"📊 Cycle done — Source: {source} | Confirmed: {len(confirmed)} | {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
 # =========================================================
 # التكرار كل 30 دقيقة
 # =========================================================
-def run_bot():
+def loop():
     while True:
-        analysis_cycle()
-        time.sleep(1800)  # كل 30 دقيقة
+        run_analysis()
+        time.sleep(1800)
 
 # =========================================================
 # التشغيل
 # =========================================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
-    threading.Thread(target=run_bot).start()
+    threading.Thread(target=loop).start()
