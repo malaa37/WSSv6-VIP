@@ -1,464 +1,257 @@
-#!/usr/bin/env python3
-# main.py — Crypto analysis bot (MEXC USDT.P) — analysis-only, sends Telegram signals every 30m
-import os, time, json, logging, math
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional
-
+# main.py
+import os
+import time
+import logging
 import requests
-import numpy as np
+import math
+from datetime import datetime, timezone, timedelta
 import pandas as pd
-from dotenv import load_dotenv
 
-load_dotenv()
+from mexc_api import public_get, fetch_account_balance
 
-# -------------- Config from ENV ---------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-MEXC_SYMBOLS_URL = "https://contract.mexc.com/open/api/v1/contract/symbols"
-MEXC_KLINE_URL = "https://contract.mexc.com/api/v1/contract/kline"
-BINANCE_KLINE_URL = "https://fapi.binance.com/fapi/v1/klines"
-MONITOR_LIMIT = int(os.getenv("SYMBOL_LIMIT", "200"))
-CYCLE_INTERVAL = int(os.getenv("CYCLE_INTERVAL_SEC", str(30*60)))  # 30 minutes
-CONFIRMED_THRESHOLD = float(os.getenv("CONFIRMED_THRESHOLD", "85.0"))
-NEAR_THRESHOLD = float(os.getenv("NEAR_THRESHOLD", "70.0"))
-ACCOUNT_USD = float(os.getenv("ACCOUNT_USD", "100.0"))
-MARGIN_PCT = float(os.getenv("MARGIN_PCT", "0.10"))  # 10% of account used as margin per trade
-LEVERAGE = int(os.getenv("LEVERAGE", "50"))
-MAX_SIGNALS_PER_CYCLE = int(os.getenv("MAX_SIGNALS_PER_CYCLE", "20"))
-HISTORY_FILE = "signals_history.json"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("WSS")
 
-# -------------- Logging -----------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("wss_analysis")
+# CONFIG from env
+TELE_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELE_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", 1800))
+SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", 200))
+CONFIRM_THRESHOLD = float(os.getenv("CONFIRM_THRESHOLD", 85.0))
+SYMBOL_SUFFIX = os.getenv("SYMBOL_SUFFIX", ".USDT.P")
+MEXC_BASE = os.getenv("MEXC_BASE_URL", "https://contract.mexc.com")
+MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", 3))
 
-# -------------- Helpers -----------------------
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def send_telegram_text(text: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials missing; skipping send")
+# ---- helpers ----
+def send_telegram(text):
+    if not TELE_TOKEN or TELE_TOKEN.startswith("any"):
+        log.warning("Telegram not configured (placeholder token). Skipping send.")
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
+    payload = {"chat_id": TELE_CHAT, "text": text, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            log.warning("Telegram send failed: %s %s", r.status_code, r.text)
-            return False
+        r.raise_for_status()
         return True
     except Exception as e:
-        log.exception("Telegram send exception: %s", e)
+        log.error("Telegram send error: %s", e)
         return False
 
-def safe_load_json(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+# ---- indicators (pure pandas) ----
+def ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
 
-def safe_save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-# -------------- Data fetch --------------------
-def fetch_mexc_symbols(limit=MONITOR_LIMIT) -> List[str]:
-    try:
-        r = requests.get(MEXC_SYMBOLS_URL, timeout=8)
-        r.raise_for_status()
-        j = r.json()
-        items = j.get("data") or []
-        syms = []
-        for it in items:
-            s = it.get("symbol") or it.get("contractCode") or it.get("name") or ""
-            if not s:
-                continue
-            # normalise: ensure USDT present
-            if "USDT" in s.upper():
-                # unify like BTCUSDT -> BTCUSDT (for Binance) or leave MEXC format
-                s_clean = s.replace("_", "").replace("/", "").upper()
-                syms.append(s_clean)
-            if len(syms) >= limit:
-                break
-        syms = list(dict.fromkeys(syms))
-        log.info("MEXC discovered %d symbols", len(syms))
-        return syms[:limit]
-    except Exception as e:
-        log.warning("MEXC symbols fetch failed: %s", e)
-        return []
-
-def fetch_klines_mexc(symbol: str, interval: str, limit:int=200) -> Optional[pd.DataFrame]:
-    # interval: '30m','1h','4h','1d' -> MEXC expects same strings
-    try:
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        r = requests.get(MEXC_KLINE_URL, params=params, timeout=8)
-        r.raise_for_status()
-        j = r.json()
-        data = j.get("data") or []
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        # MEXC sometimes returns [ts, open, high, low, close, volume]
-        # normalise columns
-        if df.shape[1] >= 6:
-            df = df.iloc[:, :6]
-            df.columns = ["open_time","open","high","low","close","volume"]
-            df["open"] = df["open"].astype(float)
-            df["high"] = df["high"].astype(float)
-            df["low"] = df["low"].astype(float)
-            df["close"] = df["close"].astype(float)
-            df["volume"] = df["volume"].astype(float)
-            df["open_time"] = pd.to_datetime(df["open_time"], unit='ms', utc=True)
-            return df
-    except Exception as e:
-        log.debug("mexc kline fail %s %s", symbol, e)
-    return None
-
-def fetch_klines_binance(symbol: str, interval: str, limit:int=200) -> Optional[pd.DataFrame]:
-    # Binance symbol like BTCUSDT
-    try:
-        url = BINANCE_KLINE_URL
-        mapping = {"30m":"30m","1h":"1h","4h":"4h","1d":"1d"}
-        params = {"symbol": symbol, "interval": mapping.get(interval,"1h"), "limit": limit}
-        r = requests.get(url, params=params, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        df = pd.DataFrame(data)
-        df = df.iloc[:, :6]
-        df.columns = ["open_time","open","high","low","close","volume"]
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float)
-        df["open_time"] = pd.to_datetime(df["open_time"], unit='ms', utc=True)
-        return df
-    except Exception as e:
-        log.debug("binance kline fail %s %s", symbol, e)
-    return None
-
-def fetch_klines(symbol: str, interval: str) -> Optional[pd.DataFrame]:
-    # try mexc first, then binance
-    df = fetch_klines_mexc(symbol, interval)
-    if df is not None and not df.empty:
-        return df
-    # try binance (symbol might be like BTCUSDT)
-    bin_sym = symbol.replace("USDT","USDT")
-    df = fetch_klines_binance(bin_sym, interval)
-    return df
-
-# -------------- Indicators ---------------------
-def ema(series: pd.Series, period:int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def rsi(series: pd.Series, period:int=14) -> pd.Series:
+def rsi(series, period=14):
     delta = series.diff()
     up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.rolling(period).mean()
+    ma_down = down.rolling(period).mean()
     rs = ma_up / (ma_down + 1e-9)
     return 100 - (100 / (1 + rs))
 
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
-# -------------- Pattern detectors -----------------
-def detect_reversal_candle(df: pd.DataFrame) -> Optional[str]:
-    # check last candle vs previous
-    if df.shape[0] < 2:
+# ---- fetch symbols (MEXC contract) ----
+def fetch_mexc_symbols(limit=200, retry=2):
+    path = "/open/api/v1/contract/symbols"
+    url = MEXC_BASE + path
+    attempts = 0
+    while attempts <= retry:
+        try:
+            r = requests.get(url, timeout=8)
+            r.raise_for_status()
+            j = r.json()
+            # MEXC response format may vary: look for list under 'data' or direct
+            symbols = []
+            if isinstance(j, dict):
+                if "data" in j and isinstance(j["data"], list):
+                    symbols = j["data"]
+                elif "symbols" in j and isinstance(j["symbols"], list):
+                    symbols = j["symbols"]
+                else:
+                    # try to parse as list of dicts
+                    if "success" in j and "data" in j:
+                        symbols = j["data"]
+            elif isinstance(j, list):
+                symbols = j
+            # from each item extract symbol string
+            out = []
+            for s in symbols:
+                if isinstance(s, dict):
+                    sym = s.get("symbol") or s.get("currency") or s.get("name")
+                else:
+                    sym = s
+                if sym and SYMBOL_SUFFIX in sym and sym.endswith(SYMBOL_SUFFIX.replace(".", "")) == False:
+                    # some exchanges return 'SEDAUSDT' style; we only want USDT.P exact suffix
+                    pass
+                if sym and SYMBOL_SUFFIX in sym:
+                    out.append(sym)
+                # also accept if endswith USDT (fallback)
+                if sym and sym.endswith("USDT") and SYMBOL_SUFFIX in ".USDT.P": 
+                    # avoid adding generic USDT unless explicit suffix required
+                    pass
+            if not out:
+                # try basic fallback: filter by contain 'USDT.P'
+                out = [ (s.get("symbol") if isinstance(s, dict) else s) for s in symbols if "USDT.P" in (s.get("symbol") if isinstance(s, dict) else s)]
+            return out[:limit]
+        except Exception as e:
+            log.warning("MEXC symbols fetch failed: %s (attempt %s)", e, attempts+1)
+            attempts += 1
+            time.sleep(1 + attempts)
+    return []
+
+# ---- fetch klines (candles) ----
+def fetch_klines(symbol, interval="1h", limit=200):
+    # MEXC contract kline endpoint (public)
+    path = f"{MEXC_BASE}/open/api/v1/contract/kline?symbol={symbol}&interval={interval}&limit={limit}"
+    try:
+        r = requests.get(path, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        # parse structure: j["data"] often list of [ts,open,high,low,close,volume]
+        data = j.get("data") if isinstance(j, dict) else None
+        if not data:
+            return None
+        cols = ["ts","open","high","low","close","vol"]
+        df = pd.DataFrame(data, columns=cols)
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        for c in ["open","high","low","close","vol"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df.set_index("ts", inplace=True)
+        return df
+    except Exception as e:
+        log.warning("fetch_klines fail for %s %s: %s", symbol, interval, e)
         return None
+
+# ---- strategy checks (simplified) ----
+def is_reversal_candle(df):
+    # expects df sorted oldest->newest, use last candle
+    if df is None or len(df) < 3:
+        return False, {}
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    # bullish reversal example: long lower wick and close above open
     body = abs(last["close"] - last["open"])
-    upper = last["high"] - max(last["close"], last["open"])
-    lower = min(last["close"], last["open"]) - last["low"]
-    # pin
-    if body > 0:
-        if lower > 2*body and last["close"] > last["open"]:
-            return "bull_pin"
-        if upper > 2*body and last["close"] < last["open"]:
-            return "bear_pin"
-    # engulfing
-    if last["close"] > last["open"] and prev["close"] < prev["open"]:
-        if last["open"] < prev["close"] and last["close"] > prev["open"]:
-            return "bull_engulf"
-    if last["close"] < last["open"] and prev["close"] > prev["open"]:
-        if last["open"] > prev["close"] and last["close"] < prev["open"]:
-            return "bear_engulf"
-    return None
+    lower_wick = last["open"] - last["low"] if last["close"] >= last["open"] else last["close"] - last["low"]
+    upper_wick = last["high"] - max(last["open"], last["close"])
+    # threshold: wick bigger than body * 1.5 and lower_wick significant
+    bullish = (last["close"] > last["open"]) and (lower_wick > body * 1.5)
+    bearish = (last["close"] < last["open"]) and (upper_wick > body * 1.5)
+    return (bullish or bearish), {"bullish": bullish, "bearish": bearish, "body": body, "lw": lower_wick, "uw": upper_wick}
 
-def detect_rsi_divergence(df: pd.DataFrame) -> Optional[str]:
-    if df.shape[0] < 20:
-        return None
-    closes = df["close"].values
-    rsi_series = rsi(df["close"]).fillna(50).values
-    # use simple heuristic: compare last two halves
-    mid = len(closes)//2
-    price_first = closes[:mid].max() if len(closes[:mid])>0 else None
-    price_second = closes[mid:].max() if len(closes[mid:])>0 else None
-    rsi_first = rsi_series[:mid].max() if len(rsi_series[:mid])>0 else None
-    rsi_second = rsi_series[mid:].max() if len(rsi_series[mid:])>0 else None
-    # bearish divergence: price higher, rsi lower
-    try:
-        if price_second and price_first and price_second > price_first and rsi_second < rsi_first:
-            return "bearish"
-        # bullish divergence using minima
-        price_low_first = closes[:mid].min()
-        price_low_second = closes[mid:].min()
-        rsi_low_first = rsi_series[:mid].min()
-        rsi_low_second = rsi_series[mid:].min()
-        if price_low_second < price_low_first and rsi_low_second > rsi_low_first:
-            return "bullish"
-    except Exception:
-        return None
-    return None
-
-# -------------- Order Block / FVG heuristic -----------
-def detect_order_block(df: pd.DataFrame) -> Optional[Dict[str, float]]:
-    # naive: large body candle in prior that reversed direction; return its high/low as OB
-    if df.shape[0] < 6:
-        return None
-    window = df.iloc[-10:-2]
-    bodies = (window["close"] - window["open"]).abs()
-    idx = bodies.idxmax()
-    ob = window.loc[idx]
-    return {"low": float(ob["low"]), "high": float(ob["high"])}
-
-# -------------- Scoring & signal generation -----------
-def score_and_make_signal(symbol: str) -> Optional[Dict[str,Any]]:
-    """
-    Returns dict with symbol, side, entry_area, sl, tp1, tp2, score, notes etc
-    """
-    try:
-        # get klines for 4h and 1h and 30m for confirmation
-        df4 = fetch_klines(symbol, "4h")
-        df1 = fetch_klines(symbol, "1h")
-        df30 = fetch_klines(symbol, "30m")
-        if df4 is None or df1 is None or df30 is None:
-            return None
-
-        # compute indicators
-        for df in (df4, df1, df30):
-            df["ema20"] = ema(df["close"], 20)
-            df["ema50"] = ema(df["close"], 50)
-            df["ema100"] = ema(df["close"], 100)
-            df["rsi14"] = rsi(df["close"], 14)
-            m_line, s_line, h = macd(df["close"])
-            df["macd_hist"] = h
-
-        # detect reversal on 4h or 1h (prefer 4h)
-        rev4 = detect_reversal_candle(df4)
-        rev1 = detect_reversal_candle(df1)
-        div4 = detect_rsi_divergence(df4)
-        div1 = detect_rsi_divergence(df1)
-        ob4 = detect_order_block(df4)
-        ob1 = detect_order_block(df1)
-
-        # determine bias
-        bias = None
-        notes = []
-        if rev4 and ("bull" in rev4 or div4 == "bullish"):
-            bias = "LONG"
-            notes.append(f"rev4={rev4}")
-        if rev4 and ("bear" in rev4 or div4 == "bearish"):
-            bias = "SHORT"
-            notes.append(f"rev4={rev4}")
-        if bias is None:
-            if rev1 and ("bull" in rev1 or div1 == "bullish"):
-                bias = "LONG"
-                notes.append(f"rev1={rev1}")
-            if rev1 and ("bear" in rev1 or div1 == "bearish"):
-                bias = "SHORT"
-                notes.append(f"rev1={rev1}")
-
-        if bias is None:
-            return None
-
-        # confirmation on 30m EMA/Rsi/MACD
-        last30 = df30.iloc[-1]
-        ema20_30 = last30["ema20"]
-        ema50_30 = last30["ema50"]
-        rsi30 = last30["rsi14"]
-        macd_hist30 = last30["macd_hist"]
-
-        score = 0.0
-        # votes from higher TF
-        if bias == "LONG":
-            # EMA alignment on 1h or 4h
-            if df1["ema20"].iloc[-1] > df1["ema50"].iloc[-1]:
-                score += 15
-            if df4["ema20"].iloc[-1] > df4["ema50"].iloc[-1]:
-                score += 15
-            if rsi30 > 50:
-                score += 20
-            if macd_hist30 > 0:
-                score += 10
-            if div1 == "bullish" or div4 == "bullish":
-                score += 20
-            if ob1:
-                score += 5
-        else:
-            if df1["ema20"].iloc[-1] < df1["ema50"].iloc[-1]:
-                score += 15
-            if df4["ema20"].iloc[-1] < df4["ema50"].iloc[-1]:
-                score += 15
-            if rsi30 < 50:
-                score += 20
-            if macd_hist30 < 0:
-                score += 10
-            if div1 == "bearish" or div4 == "bearish":
-                score += 20
-            if ob1:
-                score += 5
-
-        # extra: check EMA100 trend on higher TF
-        if bias == "LONG" and df4["ema100"].iloc[-1] < df4["ema20"].iloc[-1]:
-            score += 5
-        if bias == "SHORT" and df4["ema100"].iloc[-1] > df4["ema20"].iloc[-1]:
-            score += 5
-
-        # final: cap to 100
-        score = min(100, score)
-
-        kind = "PRE"
-        if score >= CONFIRMED_THRESHOLD:
-            kind = "CONFIRMED"
-        elif score >= NEAR_THRESHOLD:
-            kind = "NEAR"
-        else:
-            return None
-
-        # entry area: choose Order Block low/high or last support/resistance around last 3 candles
-        entry = float(last30["close"])
-        entry_area = None
-        if ob1:
-            # if long: entry area near ob high->low
-            entry_area = ob1
-        else:
-            # fallback: support/resistance using last local minima/maxima
-            highs = df1["high"].rolling(5).max().iloc[-1]
-            lows = df1["low"].rolling(5).min().iloc[-1]
-            entry_area = {"low": float(lows), "high": float(highs)}
-
-        # stop: tail of reversal candle (use 1h candle tail) +/- 1% buffer
-        if "LONG" == bias:
-            candle = df1.iloc[-1]
-            tail = float(candle["low"])
-            sl = tail - tail * 0.01
-            tp1 = entry + (entry - sl) * 1.0
-            tp2 = entry + (entry - sl) * 2.0
-        else:
-            candle = df1.iloc[-1]
-            tail = float(candle["high"])
-            sl = tail + tail * 0.01
-            tp1 = entry - (sl - entry) * 1.0
-            tp2 = entry - (sl - entry) * 2.0
-
-        # Position sizing
-        margin_usd = ACCOUNT_USD * MARGIN_PCT  # $10
-        position_notional = margin_usd * LEVERAGE
-        stop_pct = abs((entry - sl) / entry) if entry and sl else 0.01
-        potential_loss = position_notional * stop_pct
-        potential_loss_pct_of_account = (potential_loss / ACCOUNT_USD) * 100
-
-        notes.append(f"score_components:{score}")
-        result = {
-            "time": now_iso(),
-            "symbol": symbol,
-            "side": bias,
-            "kind": kind,
-            "score": round(score,2),
-            "entry": round(entry, 8),
-            "entry_area": entry_area,
-            "sl": round(sl, 8),
-            "tp1": round(tp1, 8),
-            "tp2": round(tp2, 8),
-            "margin_usd": round(margin_usd,2),
-            "notional_usd": round(position_notional,2),
-            "stop_pct": round(stop_pct*100,4),
-            "potential_loss_usd": round(potential_loss,4),
-            "potential_loss_pct_of_account": round(potential_loss_pct_of_account,4),
-            "notes": notes
-        }
-        return result
-    except Exception as e:
-        log.exception("score error %s %s", symbol, e)
+def analyze_symbol(symbol):
+    # get 4h and 1h candles
+    df4 = fetch_klines(symbol, interval="4h", limit=200)
+    df1 = fetch_klines(symbol, interval="1h", limit=200)
+    if df4 is None or df1 is None:
         return None
 
-# -------------- History ------------------------
-def append_history(record):
-    hist = safe_load_json(HISTORY_FILE)
-    hist.insert(0, record)
-    hist = hist[:5000]
-    safe_save_json(HISTORY_FILE, hist)
+    # indicators on 1h
+    close1 = df1["close"]
+    rsi1 = rsi(close1, period=15).iloc[-1]
+    ema20 = ema(close1, 20).iloc[-1]
+    ema50 = ema(close1, 50).iloc[-1]
+    ema100 = ema(close1, 100).iloc[-1]
+    macd_line, macd_sig, macd_hist = macd(close1)
+    macd_hist_last = macd_hist.iloc[-1]
 
-# -------------- Runner --------------------------
-def run_cycle_and_send():
-    symbols = fetch_mexc_symbols(MONITOR_LIMIT)
-    if not symbols:
-        log.warning("no symbols found")
-        return
-    results_to_send = []
-    scanned = 0
+    # reversal candle check on 4h (we prefer strong structure on higher timeframe)
+    reversal, revinfo = is_reversal_candle(df4)
+    # SMC/ICT/OB checks are complex; here simplified:
+    ob_score = 0
+    if ema20 > ema50 > ema100:
+        trend = "up"
+        ob_score += 1
+    elif ema20 < ema50 < ema100:
+        trend = "down"
+        ob_score += 1
+    else:
+        trend = "side"
+
+    # compute a simple score from criteria
+    score = 0
+    if reversal:
+        score += 40
+    if (rsi1 > 50 and trend == "up") or (rsi1 < 50 and trend == "down"):
+        score += 25
+    if abs(macd_hist_last) > 0:
+        score += 15
+    score += ob_score * 10
+
+    # Build suggestion if score >= threshold (translated to percent)
+    possible = score >= (CONFIRM_THRESHOLD / 100.0) * 100  # convert
+    result = {
+        "symbol": symbol,
+        "score": int(score),
+        "rsi": float(rsi1),
+        "ema20": float(ema20),
+        "ema50": float(ema50),
+        "ema100": float(ema100),
+        "macd_hist": float(macd_hist_last),
+        "reversal": revinfo,
+        "trend": trend,
+        "possible": possible,
+    }
+    return result
+
+def format_signal(res):
+    s = res["symbol"]
+    side = "LONG" if res["trend"] == "up" and res["reversal"].get("bullish") else "SHORT"
+    entry = "market"
+    stop = "tail"
+    tp1 = "TBD"
+    tp2 = "TBD"
+    lines = [
+        f"🟢 CONFIRMED — {s}" if res["possible"] else f"🟡 NEAR — {s}",
+        f"SIDE: {side}",
+        f"ENTRY: {entry}",
+        f"SL: {stop}  TP1: {tp1}  TP2: {tp2}",
+        f"RSI(1h): {res['rsi']:.2f} | SCORE: {res['score']}%",
+        f"Notes: trend={res['trend']} reversal={res['reversal']}",
+        "⚠️ Analysis only — no automatic orders. Verify liquidity/slippage before manual execution."
+    ]
+    return "\n".join(lines)
+
+# ---- main cycle ----
+def run_cycle():
+    start = datetime.now(timezone.utc)
+    log.info("Starting analysis cycle")
+    symbols = fetch_mexc_symbols(limit=SCAN_LIMIT)
+    log.info("Discovered %s symbols.", len(symbols))
+    found = []
+    sent = 0
     for sym in symbols:
-        scanned += 1
+        if len(found) >= 200:
+            break
         try:
-            sig = score_and_make_signal(sym)
-            if not sig:
-                continue
-            # only CONFIRMED signals
-            if sig["kind"] == "CONFIRMED":
-                results_to_send.append(sig)
-                if len(results_to_send) >= MAX_SIGNALS_PER_CYCLE:
-                    break
-            # optionally collect NEAR as well if you want
+            res = analyze_symbol(sym)
+            if res and res["possible"]:
+                msg = format_signal(res)
+                ok = send_telegram(msg)
+                if ok:
+                    sent += 1
+                found.append(res)
+                log.info("Signal for %s (score=%s) sent=%s", sym, res["score"], ok)
         except Exception as e:
-            log.debug("err sym %s %s", sym, e)
-            continue
+            log.exception("Error analyzing %s: %s", sym, e)
+    duration = (datetime.now(timezone.utc) - start).seconds
+    summary = f"📊 Cycle done — Total scanned: {len(symbols)} | Found: {len(found)} | Sent: {sent} | Duration: {duration}s"
+    log.info(summary)
+    send_telegram(summary)
 
-    # Build message grouped
-    if not results_to_send:
-        log.info("no confirmed signals this cycle")
-        return
-
-    header = f"*WSS Signals — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}*\n"
-    parts = [header]
-    for r in results_to_send:
-        part = (
-            f"🟢 *{r['kind']}* — `{r['symbol']}`\n"
-            f"SIDE: *{r['side']}*  ENTRY: `{r['entry']}`\n"
-            f"SL: `{r['sl']}`  TP1: `{r['tp1']}`  TP2: `{r['tp2']}`\n"
-            f"Score: *{r['score']}%*  | Notional: `${r['notional_usd']}` | Margin: `${r['margin_usd']}`\n"
-            f"StopDist: {r['stop_pct']}%  | PotentialLoss: `${r['potential_loss_usd']}` ({r['potential_loss_pct_of_account']}% acc)\n"
-            f"EntryArea: low `{r['entry_area']['low']}` high `{r['entry_area']['high']}`\n"
-            f"Notes: {'; '.join(r.get('notes',[]))}\n"
-            "――――――\n"
-        )
-        parts.append(part)
-        append_history(r)
-
-    msg = "\n".join(parts)
-    sent = send_telegram_text(msg)
-    log.info("sent signals: %s  (scanned %s symbols)", len(results_to_send), scanned)
-
-# -------------- Main ----------------------------
 if __name__ == "__main__":
-    log.info("Starting WSS analysis bot — every 30 minutes")
-    # create history file if missing
-    try:
-        _ = safe_load_json(HISTORY_FILE)
-    except Exception:
-        safe_save_json(HISTORY_FILE, [])
+    # startup msg
+    send_telegram("✅ WSS Analytical Bot starting.")
     while True:
         try:
-            run_cycle_and_send()
+            run_cycle()
         except Exception as e:
-            log.exception("Cycle failure: %s", e)
-        time.sleep(CYCLE_INTERVAL)
+            log.exception("Cycle error: %s", e)
+        time.sleep(CYCLE_SECONDS)
