@@ -1,31 +1,23 @@
-# 💹 WSS Crypto Analyzer Bot (MEXC USDT.P)
+# WSS Analytical Bot (MEXC / USDT.P)
 
-بوت تحليلي ذكي للعملات الرقمية، يقوم بمسح جميع أزواج **USDT.P** على منصة **MEXC Futures**، 
-ويحسب إشارات التداول بناءً على مجموعة من المدارس الفنية المتقدمة:
+Requirements:
+- Python 3.11+ (recommended)
+- Dependencies in requirements.txt (requests, pandas, etc.)
 
-- مؤشرات: **RSI / MACD / EMA20 / EMA50 / EMA100**
-- الشموع الانعكاسية (Pin & Engulfing)
-- الدايفرجنس (RSI Divergence)
-- مدارس **ICT / SMC / Order Block / FVG**
-- نسبة نجاح إشارات ≥ 85%
+Environment variables (on Render):
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+- MEXC_API_KEY
+- MEXC_API_SECRET
+- MEXC_BASE_URL (optional)
+- SCAN_LIMIT, CYCLE_SECONDS, CONFIRM_THRESHOLD, SYMBOL_SUFFIX
 
-يرسل البوت إشارات **LONG / SHORT** كل 30 دقيقة إلى تليجرام.
+Deploy:
+1. Push repo to GitHub.
+2. Connect Render to GitHub repo, set Environment variables.
+3. Deploy service (background worker).
+4. Check logs -> bot startup message.
 
----
-
-## ⚙️ المتطلبات
-
-- حساب [GitHub](https://github.com)
-- حساب [Render](https://render.com)
-- بوت تليجرام (عن طريق [BotFather](https://t.me/BotFather))
-- Python ≥ 3.9
-
----
-
-## 📦 التثبيت محليًا (اختياري)
-
-```bash
-git clone https://github.com/<YOUR_USERNAME>/WSS-Crypto-Analyzer.git
-cd WSS-Crypto-Analyzer
-pip install -r requirements.txt
-python main.py# WSSv6-VIP
+Notes:
+- Strategy code includes simplified SMC/ICT checks; you (أو أنا لاحقًا) يمكن نطورها.
+- Start ببيانات اختبار (paper) قبل تفعيل تنفيذ أوتوماتيكي.
