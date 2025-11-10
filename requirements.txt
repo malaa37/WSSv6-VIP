@@ -1,4 +1,6 @@
-requests==2.31.0
-pandas==2.2.3
-numpy==1.26.4
-python-dotenv==1.0.0
+flask
+requests
+pandas
+numpy
+ta
+telebot
